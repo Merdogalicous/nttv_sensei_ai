@@ -21,12 +21,11 @@ import faiss  # type: ignore
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
+from nttv_chatbot.chunking import ChunkingSettings, build_chunks
 from nttv_chatbot.document_parsing import (
     DocumentParseSkipped,
     ParserSettings,
     SUPPORTED_INGEST_EXTENSIONS,
-    StructuredDocument,
-    StructuredDocumentElement,
     parse_file,
 )
 
@@ -52,10 +51,6 @@ META_PATH = INDEX_DIR / "meta.pkl"
 FAISS_PATH = INDEX_DIR / "index.faiss"
 FAISS_PATH_LEGACY = INDEX_DIR / "faiss.index"
 
-CHUNK_SIZE = 700
-CHUNK_OVERLAP = 120
-
-
 # ---------------------------
 # Utilities
 # ---------------------------
@@ -73,102 +68,15 @@ def iter_source_files() -> List[Path]:
     files.sort()
     return files
 
-
-def simple_chunk_text(
-    text: str,
-    source: str,
-    meta: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    """Naive character-based chunking with overlap."""
-
-    base_meta = {"priority": _priority_for_source(source), "source": source}
-    if meta:
-        base_meta.update(meta)
-
-    chunks: List[Dict[str, Any]] = []
-    start = 0
-    text = text or ""
-    n = len(text)
-
-    while start < n:
-        end = min(start + CHUNK_SIZE, n)
-        chunk_text = text[start:end].strip()
-        if chunk_text:
-            chunks.append(
-                {
-                    "text": chunk_text,
-                    "source": source,
-                    "meta": dict(base_meta),
-                }
-            )
-
-        if end == n:
-            break
-        start = end - CHUNK_OVERLAP
-
-    return chunks
-
-
-def simple_chunk_document(document: StructuredDocument, source: str) -> List[Dict[str, Any]]:
-    chunks: List[Dict[str, Any]] = []
-    buffered_elements: List[StructuredDocumentElement] = []
-    buffered_parts: List[str] = []
-    buffered_chars = 0
-
-    def flush_buffer() -> None:
-        nonlocal buffered_elements, buffered_parts, buffered_chars
-        if not buffered_parts:
-            return
-
-        block_text = "\n\n".join(buffered_parts).strip()
-        if block_text:
-            chunks.extend(
-                simple_chunk_text(
-                    block_text,
-                    source=source,
-                    meta=_merge_element_metadata(source, buffered_elements, document.parser_name, document.file_type),
-                )
-            )
-
-        buffered_elements = []
-        buffered_parts = []
-        buffered_chars = 0
-
-    for element in document.elements:
-        block_text = _element_block_text(element)
-        if not block_text:
-            continue
-
-        if len(block_text) > CHUNK_SIZE:
-            flush_buffer()
-            chunks.extend(
-                simple_chunk_text(
-                    block_text,
-                    source=source,
-                    meta=_merge_element_metadata(source, [element], document.parser_name, document.file_type),
-                )
-            )
-            continue
-
-        projected_chars = buffered_chars + len(block_text) + (2 if buffered_parts else 0)
-        if buffered_parts and projected_chars > CHUNK_SIZE:
-            flush_buffer()
-
-        buffered_elements.append(element)
-        buffered_parts.append(block_text)
-        buffered_chars += len(block_text) + (2 if len(buffered_parts) > 1 else 0)
-
-    flush_buffer()
-    return chunks
-
-
 def parse_and_chunk_files(
     files: Iterable[Path],
     *,
     root: Path = ROOT,
     parser_settings: Optional[ParserSettings] = None,
+    chunking_settings: Optional[ChunkingSettings] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str], List[Dict[str, str]]]:
     parser_settings = parser_settings or ParserSettings.from_env()
+    chunking_settings = chunking_settings or ChunkingSettings.from_env()
 
     all_chunks: List[Dict[str, Any]] = []
     ingested_files: List[str] = []
@@ -194,7 +102,11 @@ def parse_and_chunk_files(
         print(f"  Elements: {len(parsed_document.elements)}")
         print(f"  Length: {parsed_length} characters")
 
-        file_chunks = simple_chunk_document(parsed_document, source=source)
+        file_chunks = build_chunks(
+            parsed_document,
+            source_file=source,
+            settings=chunking_settings,
+        )
         print(f"  -> {len(file_chunks)} chunks")
 
         if file_chunks:
@@ -205,92 +117,6 @@ def parse_and_chunk_files(
             print("  -> skipped: parser returned no chunkable text")
 
     return all_chunks, ingested_files, skipped_files
-
-
-def _priority_for_source(source: str) -> int:
-    lower_source = source.lower()
-    if "glossary" in lower_source:
-        return 3
-    if "rank" in lower_source:
-        return 3
-    if "technique description" in lower_source or "technique_descriptions" in lower_source:
-        return 3
-    if "kihon" in lower_source or "sanshin" in lower_source:
-        return 2
-    return 1
-
-
-def _element_block_text(element: StructuredDocumentElement) -> str:
-    text = (element.text or "").strip()
-    if not text:
-        return ""
-
-    if element.element_type == "heading":
-        return text
-
-    if element.heading_path:
-        heading_context = " > ".join(element.heading_path).strip()
-        if heading_context:
-            return f"{heading_context}\n\n{text}".strip()
-
-    return text
-
-
-def _merge_element_metadata(
-    source: str,
-    elements: List[StructuredDocumentElement],
-    parser_name: str,
-    file_type: str,
-) -> Dict[str, Any]:
-    pages = [page for element in elements for page in (element.page_start, element.page_end) if page is not None]
-    heading_path = _common_heading_path([element.heading_path for element in elements])
-    element_types = [element.element_type for element in elements if element.element_type]
-    unique_element_types = list(dict.fromkeys(element_types))
-
-    raw_metadata: Dict[str, Any]
-    if len(elements) == 1:
-        raw_metadata = dict(elements[0].raw_metadata)
-    else:
-        raw_metadata = {
-            "element_count": len(elements),
-            "element_types": unique_element_types,
-            "pages": sorted(set(pages)),
-        }
-
-    page_start = min(pages) if pages else None
-    page_end = max(pages) if pages else None
-
-    return {
-        "priority": _priority_for_source(source),
-        "source": source,
-        "parser": parser_name,
-        "file_type": file_type,
-        "page": page_start,
-        "page_start": page_start,
-        "page_end": page_end,
-        "heading_path": heading_path,
-        "element_type": unique_element_types[0] if len(unique_element_types) == 1 else "mixed",
-        "raw_metadata": raw_metadata,
-    }
-
-
-def _common_heading_path(paths: List[List[str]]) -> List[str]:
-    non_empty_paths = [path for path in paths if path]
-    if not non_empty_paths:
-        return []
-
-    prefix = list(non_empty_paths[0])
-    for path in non_empty_paths[1:]:
-        match_len = 0
-        for left, right in zip(prefix, path):
-            if left != right:
-                break
-            match_len += 1
-        prefix = prefix[:match_len]
-        if not prefix:
-            break
-
-    return prefix or list(non_empty_paths[-1])
 
 
 def _relative_source(path: Path, root: Path) -> str:
@@ -327,6 +153,7 @@ def build_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
 
 def main() -> None:
     parser_settings = ParserSettings.from_env()
+    chunking_settings = ChunkingSettings.from_env()
 
     print(f"DATA_DIR: {DATA_DIR}")
     print(f"INDEX_DIR: {INDEX_DIR}")
@@ -336,6 +163,13 @@ def main() -> None:
         f"parser={parser_settings.pdf_parser}, "
         f"max_pages={parser_settings.pdf_parse_max_pages}, "
         f"fail_open={parser_settings.pdf_fail_open}"
+    )
+    print(
+        "Chunk settings: "
+        f"target_tokens={chunking_settings.target_tokens}, "
+        f"max_tokens={chunking_settings.max_tokens}, "
+        f"overlap_tokens={chunking_settings.overlap_tokens}, "
+        f"min_tokens={chunking_settings.min_tokens}"
     )
 
     files = iter_source_files()
@@ -350,6 +184,7 @@ def main() -> None:
         files,
         root=ROOT,
         parser_settings=parser_settings,
+        chunking_settings=chunking_settings,
     )
 
     print(f"\nTotal chunks (pre-filter): {len(all_chunks)}")
@@ -411,8 +246,12 @@ def main() -> None:
         "embed_model": EMBED_MODEL_NAME,
         "faiss_path": str(FAISS_PATH),
         "top_k": 6,
-        "chunk_size": CHUNK_SIZE,
-        "chunk_overlap": CHUNK_OVERLAP,
+        "chunk_size": chunking_settings.max_tokens * 4,
+        "chunk_overlap": chunking_settings.overlap_tokens * 4,
+        "chunk_target_tokens": chunking_settings.target_tokens,
+        "chunk_max_tokens": chunking_settings.max_tokens,
+        "chunk_overlap_tokens": chunking_settings.overlap_tokens,
+        "chunk_min_tokens": chunking_settings.min_tokens,
         "files": ingested_files,
         "skipped_files": skipped_files,
         "parsing": {
@@ -420,6 +259,13 @@ def main() -> None:
             "pdf_parser": parser_settings.pdf_parser,
             "pdf_parse_max_pages": parser_settings.pdf_parse_max_pages,
             "pdf_fail_open": parser_settings.pdf_fail_open,
+        },
+        "chunking": {
+            "strategy": "section-aware",
+            "target_tokens": chunking_settings.target_tokens,
+            "max_tokens": chunking_settings.max_tokens,
+            "overlap_tokens": chunking_settings.overlap_tokens,
+            "min_tokens": chunking_settings.min_tokens,
         },
         "num_chunks": len(all_chunks),
         "faiss_ntotal": int(index.ntotal),

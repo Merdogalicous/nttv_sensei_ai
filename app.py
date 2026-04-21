@@ -379,6 +379,15 @@ def retrieve(q: str, k: int | None = None) -> List[Dict[str, Any]]:
                     "meta": meta,
                     "source": meta.get("source"),
                     "page": meta.get("page"),
+                    "page_start": meta.get("page_start", meta.get("page")),
+                    "page_end": meta.get("page_end", meta.get("page")),
+                    "heading_path": meta.get("heading_path") or [],
+                    "priority_bucket": meta.get("priority_bucket"),
+                    "chunk_id": meta.get("chunk_id"),
+                    "rank_tag": meta.get("rank_tag"),
+                    "school_tag": meta.get("school_tag"),
+                    "weapon_tag": meta.get("weapon_tag"),
+                    "technique_tag": meta.get("technique_tag"),
                     "score": float(score),
                     "rerank_score": float(new_score),
                 },
@@ -403,8 +412,12 @@ def build_context(snippets: List[Dict[str, Any]], max_chars: int = 6000) -> str:
     lines, total = [], 0
     for i, s in enumerate(snippets, 1):
         tag = f"[{i}] {os.path.basename(s['source'])}"
-        if s.get("page"):
-            tag += f" (p. {s['page']})"
+        page_start = s.get("page_start") or s.get("page")
+        page_end = s.get("page_end") or page_start
+        if page_start and page_end and page_start != page_end:
+            tag += f" (pp. {page_start}-{page_end})"
+        elif page_start:
+            tag += f" (p. {page_start})"
         block = f"{tag}\n{s['text']}\n\n---\n"
         if total + len(block) > max_chars:
             break
@@ -416,6 +429,27 @@ def retrieval_quality(hits: List[Dict[str, Any]]) -> float:
     if not hits:
         return 0.0
     return max(h.get("rerank_score", h.get("score", 0.0)) for h in hits)
+
+
+def _format_page_range(meta: Dict[str, Any]) -> str:
+    page_start = meta.get("page_start") or meta.get("page")
+    page_end = meta.get("page_end") or page_start
+    if page_start and page_end and page_start != page_end:
+        return f"{page_start}-{page_end}"
+    if page_start:
+        return str(page_start)
+    return ""
+
+
+def _format_detected_tags(meta: Dict[str, Any]) -> str:
+    labels = [
+        ("rank", meta.get("rank_tag")),
+        ("school", meta.get("school_tag")),
+        ("weapon", meta.get("weapon_tag")),
+        ("technique", meta.get("technique_tag")),
+    ]
+    parts = [f"{name}: {value}" for name, value in labels if value]
+    return ", ".join(parts)
 
 
 # --------------------------------------------------------------------
@@ -1207,7 +1241,20 @@ if go and q.strip():
     if show_debug:
         st.markdown("### Retrieved sources")
         for i, h in enumerate(top_passages, 1):
-            name = os.path.basename(h.get("source") or "")
+            meta = h.get("meta") or {}
+            source_file = meta.get("source_file") or h.get("source") or ""
+            name = os.path.basename(source_file)
+            page_range = _format_page_range(meta)
+            heading_path = " > ".join(meta.get("heading_path") or [])
+            tags = _format_detected_tags(meta)
+            priority_bucket = meta.get("priority_bucket") or f"p{max(1, 4 - int(meta.get('priority', 1) or 1))}"
+            if page_range:
+                st.caption(f"Pages: {page_range}")
+            if heading_path:
+                st.caption(f"Heading: {heading_path}")
+            st.caption(f"Priority bucket: {priority_bucket}")
+            if tags:
+                st.caption(f"Tags: {tags}")
             st.write(
                 f"[{i}] {name} — score {h.get('score', 0):.3f} — "
                 f"priority {int(h.get('meta',{}).get('priority',0))}"

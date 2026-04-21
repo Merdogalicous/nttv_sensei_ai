@@ -15,6 +15,7 @@ The stack centers on:
 - OpenRouter-compatible model routing through environment variables.
 - Shared ingest pipeline for `.txt`, `.md`, `.docx`, and now structured `.pdf` parsing.
 - Optional Docling-backed PDF ingestion with page-aware and heading-aware metadata.
+- Section-aware, metadata-rich chunking with stable chunk IDs and token-based controls.
 
 ## Architecture
 
@@ -23,7 +24,7 @@ The stack centers on:
 `ingest.py`:
 - scans `data/`
 - parses files through `nttv_chatbot/document_parsing.py`
-- chunks parsed output
+- chunks parsed output through `nttv_chatbot/chunking.py`
 - embeds chunks
 - writes:
   - `index/index.faiss`
@@ -40,6 +41,14 @@ PDF files:
 - use Docling as the primary parser when available
 - can fall back cleanly to `pypdf` when `PDF_FAIL_OPEN=true`
 - never stop the whole ingest run because one PDF failed
+
+Chunking:
+- groups structured material by section first
+- keeps headings attached to their content
+- prefers paragraph boundaries over blind splitting
+- supports token-based target/max/min/overlap settings
+- merges tiny fragments into better retrieval chunks when possible
+- preserves stable source traceability in every chunk
 
 ### Retrieval
 
@@ -127,6 +136,15 @@ If you deploy to Render or another host and want PDF ingestion there too, instal
 | `PDF_PARSE_MAX_PAGES` | `25` | Optional max pages per PDF during ingest. |
 | `PDF_FAIL_OPEN` | `true` | If Docling fails, fall back cleanly or skip the PDF instead of killing ingest. |
 
+### Chunking
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `CHUNK_TARGET_TOKENS` | `180` | Soft target size for section-aware chunks. |
+| `CHUNK_MAX_TOKENS` | `240` | Hard cap before chunk splitting. |
+| `CHUNK_OVERLAP_TOKENS` | `40` | Overlap budget carried into the next chunk. |
+| `CHUNK_MIN_TOKENS` | `60` | Small-fragment merge threshold. |
+
 ### Example `.env`
 
 ```env
@@ -143,6 +161,11 @@ PDF_PARSER=docling
 PDF_PARSE_MAX_PAGES=
 PDF_FAIL_OPEN=true
 
+CHUNK_TARGET_TOKENS=180
+CHUNK_MAX_TOKENS=240
+CHUNK_OVERLAP_TOKENS=40
+CHUNK_MIN_TOKENS=60
+
 TOP_K=6
 TEMPERATURE=0.0
 MAX_TOKENS=512
@@ -157,6 +180,7 @@ python ingest.py
 
 The ingest run now prints:
 - parser settings
+- chunk settings
 - per-file parser used
 - per-file element counts
 - skipped file reasons
@@ -170,19 +194,39 @@ Each chunk in `index/meta.pkl` still preserves the existing keys used by the app
 - `meta.source`
 
 Structured ingest adds these metadata fields when available:
+- `chunk_id`
 - `meta.parser`
+- `meta.source_file`
 - `meta.file_type`
 - `meta.page`
 - `meta.page_start`
 - `meta.page_end`
 - `meta.heading_path`
-- `meta.element_type`
+- `meta.section_title`
+- `meta.content_type`
+- `meta.rank_tag`
+- `meta.school_tag`
+- `meta.weapon_tag`
+- `meta.technique_tag`
+- `meta.priority_bucket`
+- `meta.char_count`
+- `meta.estimated_token_count`
 - `meta.raw_metadata`
 
 `index/config.json` now also records:
 - `files`
 - `skipped_files`
 - `parsing`
+- `chunking`
+
+### Chunking Strategy
+
+The chunk builder is section-aware first and size-aware second:
+- rank requirements, technique descriptions, and sectioned PDF output are chunked by heading path before token limits apply
+- flat text falls back to paragraph-aware chunking
+- short sections stay intact when possible
+- larger sections split on paragraph boundaries with overlap carried forward for retrieval continuity
+- chunk IDs are stable for the same source content, which makes re-ingests easier to reason about
 
 ## PDF Support
 
@@ -272,6 +316,12 @@ Run just the parsing tests:
 
 ```bash
 pytest tests/test_document_parsing.py
+```
+
+Run the chunking tests:
+
+```bash
+pytest tests/test_chunking.py
 ```
 
 ## License
