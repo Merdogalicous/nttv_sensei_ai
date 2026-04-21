@@ -1,157 +1,147 @@
-# NTTV Chatbot — Deterministic RAG Assistant for Ninja Training TV
+# NTTV Chatbot - Deterministic RAG Assistant for Ninja Training TV
 
-A **RAG-based**, **extractor-driven**, and **deterministic** chatbot for Ninja Training TV (NTTV).  
-Built with **FAISS**, **sentence-transformers**, **Streamlit**, and a suite of custom **extractors** (rank, kihon, sanshin, schools, weapons, kyusho, etc.).  
-Runs **locally** and on **Render** with the same ingestion + retrieval pipeline.
+A RAG-based, extractor-driven chatbot for Ninja Training TV (NTTV).
 
----
+The stack centers on:
+- deterministic extractors for known-known questions
+- FAISS retrieval over embedded curriculum content
+- OpenRouter-compatible LLM generation
+- a local-first ingest pipeline that builds `index/` from `data/`
 
-## Table of Contents
-- [Key Features](#-key-features)
-- [Architecture (Brief)](#-architecture-brief)
-- [Repository Structure](#-repository-structure)
-- [Installation (Local)](#-installation-local)
-- [Environment Variables](#-environment-variables)
-- [Build the Index & Run Streamlit](#-build-the-index--run-streamlit)
-- [Accessing the NTTV Chatbot API (Local)](#accessing-the-nttv-chatbot-api-local)
-- [Deploying to Render](#-deploying-to-render)
-- [Troubleshooting](#-troubleshooting)
-- [Roadmap](#-roadmap)
-- [License & Credits](#-license--credits)
+## Key Features
 
----
+- Deterministic extractors for rank requirements, kihon, sanshin, schools, weapons, kyusho, and related topics.
+- FAISS `IndexFlatIP` retrieval over normalized embeddings from `sentence-transformers/all-MiniLM-L6-v2`.
+- OpenRouter-compatible model routing through environment variables.
+- Shared ingest pipeline for `.txt`, `.md`, `.docx`, and now structured `.pdf` parsing.
+- Optional Docling-backed PDF ingestion with page-aware and heading-aware metadata.
 
-## 🚀 Key Features
+## Architecture
 
-### 🧠 Deterministic Knowledge Layer (Extractors)
-- Extractors for:
-  - **Rank requirements**
-  - **Kihon Happō**
-  - **Sanshin no Kata**
-  - **Schools (Ryūha)**
-  - **Weapons**
-  - **Kyusho**
-- Hard-coded, rank-aware answers where appropriate.
-- **Zero hallucinations** for strict/deterministic queries when extractors fire.
-- UI badge via `{"det_path":"deterministic/..."}` when a deterministic path answered.
+### Ingestion
 
-### 🔍 RAG Retrieval Engine
-- **FAISS** vector index, **IndexFlatIP** (exact) on **normalized** 384-dim vectors.
-- **Sentence-Transformers** embeddings: `sentence-transformers/all-MiniLM-L6-v2`.
-- Priority-aware reranking:
-  - **P1**: Rank files
-  - **P2**: Techniques / schools / kihon / weapons
-  - **P3**: Other passages
-- Adjustable **TOP_K** and robust fallback heuristics.
+`ingest.py`:
+- scans `data/`
+- parses files through `nttv_chatbot/document_parsing.py`
+- chunks parsed output
+- embeds chunks
+- writes:
+  - `index/index.faiss`
+  - `index/faiss.index`
+  - `index/meta.pkl`
+  - `index/config.json`
 
-### 💬 Streamlit App UI
-- Question input + answer display.
-- **Debug mode** (top passages, raw model response).
-- **Explanation mode** (short fact → brief rationale).
-- Technique detail level (Brief / Standard / Full).
-- Source citations and passage inspection.
+Text files keep the existing behavior through the new parser interface:
+- `.txt`
+- `.md`
+- `.docx`
 
----
+PDF files:
+- use Docling as the primary parser when available
+- can fall back cleanly to `pypdf` when `PDF_FAIL_OPEN=true`
+- never stop the whole ingest run because one PDF failed
 
-## 🧱 Architecture (Brief)
+### Retrieval
 
-**Ingestion (`ingest.py`)**
-- Reads `/data`, chunks, embeds, and writes artifacts to `/index`.
-- Artifacts:
-  - `index/faiss.index` **and** `index/index.faiss` (dual-write to avoid env drift)
-  - `index/meta.pkl` (list of chunk dicts)
-  - `index/config.json` (paths, counts, model, chunking params)
-- Strict pre/post checks ensure **1:1 alignment** between FAISS vectors and `meta.pkl`.
+`app.py`:
+- lazily loads FAISS plus `meta.pkl`
+- preserves deterministic extractor priority for known-known questions
+- reranks retrieved chunks with source-aware heuristics
+- uses OpenRouter-compatible LLM calls for synthesis
 
-**App / Retrieval (`app.py`)**
-- Lazy cached loader `_load_index_and_meta()` with sanity checks:
-  - Rejects mismatched FAISS/meta pairs and falls back appropriately.
-- Retrieval → overfetch (capped by `ntotal`) → rerank → build context → LLM.
-- Deterministic extractors run first for “known-knowns”; fallback to RAG+LLM.
+## Repository Structure
 
-**LLM**
-- OpenRouter-compatible endpoint via `OPENAI_BASE_URL` + `OPENAI_API_KEY`.
-- Switch model with env `MODEL` (e.g., `google/gemma-3n-e4b-it`).
-
----
-
-## 📦 Repository Structure
-
-```
+```text
 nttv_chatbot_ext/
-├── app.py                 # Streamlit UI + retrieval + extractors routing
-├── ingest.py              # Build FAISS + meta from /data
-├── api_server.py          # (Optional) FastAPI server for /query
-├── extractors/            # Deterministic extractors (rank, kihon, weapons, etc.)
-├── data/                  # Authoritative text sources
-├── index/                 # FAISS artifacts (created by ingest.py)
-├── requirements.txt       # Python dependencies
-├── render.yaml            # Render Blueprint for cloud deployment
-├── nttv_test.html         # Minimal chat test page (vanilla HTML/JS)
-└── README.md              # You are here
+|-- app.py
+|-- api_server.py
+|-- ingest.py
+|-- extractors/
+|-- data/
+|-- index/
+|-- nttv_chatbot/
+|   |-- config.py
+|   |-- document_parsing.py
+|   `-- llm_client.py
+|-- tests/
+|-- requirements.txt
+|-- render.yaml
+`-- README.md
 ```
 
----
+## Installation
 
-## 🛠 Installation (Local)
+### 1) Create a virtual environment
 
-### 1) Clone & create venv
-```bash
-git clone https://github.com/paulzim/nttv_chatbot_ext
-cd nttv_chatbot_ext
-python -m venv .venv
-```
-
-**macOS / Linux**
-```bash
-source .venv/bin/activate
-```
-
-**Windows (PowerShell)**
 ```powershell
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-### 2) Install dependencies
+macOS/Linux:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+### 2) Install the base dependencies
+
 ```bash
 python -m pip install -U pip
 pip install -r requirements.txt
 ```
 
----
+### 3) Optional: install Docling for structured PDF ingestion
 
-## ⚙️ Environment Variables
+Docling is intentionally optional. Base text ingestion does not require it.
 
-Used locally (via `.env`) and on Render.
+```bash
+pip install docling==2.88.0
+```
 
-| Variable                               | Example                                   | Purpose                                  |
-|----------------------------------------|-------------------------------------------|------------------------------------------|
-| `OPENAI_BASE_URL`                      | `https://openrouter.ai/api/v1`            | OpenRouter/OpenAI-compatible endpoint    |
-| `OPENAI_API_KEY`                       | `sk-or-...`                               | API key (keep secret)                    |
-| `MODEL`                                | `google/gemma-3n-e4b-it`                  | LLM model ID                             |
-| `EMBED_MODEL_NAME`                     | `sentence-transformers/all-MiniLM-L6-v2`  | Embedding model                          |
-| `INDEX_DIR`                            | `index`                                   | Index directory root                     |
-| `INDEX_PATH`                           | `index/faiss.index`                       | FAISS index file path (dual-written)     |
-| `META_PATH`                            | `index/meta.pkl`                          | Pickled metadata (chunks)                |
-| `RANK_FILE`                            | `data/nttv rank requirements.txt`         | Rank source of truth                     |
-| `TOP_K`                                | `6`                                       | Retrieval depth                          |
-| `TEMPERATURE`                          | `0.0`                                     | Deterministic output                     |
-| `MAX_TOKENS`                           | `512`                                     | Generation token cap                     |
-| `STREAMLIT_BROWSER_GATHERUSAGESTATS`   | `false`                                   | Disable Streamlit telemetry              |
+If you deploy to Render or another host and want PDF ingestion there too, install Docling in that environment as well.
 
-> **Note:** Historical configs may use `MODEL_NAME`; this project expects `MODEL`.
+## Environment Variables
 
-**Example `.env` (local)**
+### Core app/runtime
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `OPENAI_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter/OpenAI-compatible endpoint |
+| `OPENAI_API_KEY` | `sk-or-...` | API key |
+| `MODEL` | `google/gemma-3n-e4b-it` | Primary synthesis model |
+| `INDEX_DIR` | `index` | Index directory root |
+| `INDEX_PATH` | `index/faiss.index` | FAISS index path |
+| `META_PATH` | `index/meta.pkl` | Chunk metadata path |
+| `TOP_K` | `6` | Retrieval depth |
+| `TEMPERATURE` | `0.0` | Generation temperature |
+| `MAX_TOKENS` | `512` | Generation cap |
+
+### PDF ingest
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `ENABLE_PDF_INGEST` | `true` | Enables PDF ingest. Default behavior is automatic enablement when Docling is installed. |
+| `PDF_PARSER` | `docling` | PDF parser selection. Supported values: `docling`, `pypdf`. |
+| `PDF_PARSE_MAX_PAGES` | `25` | Optional max pages per PDF during ingest. |
+| `PDF_FAIL_OPEN` | `true` | If Docling fails, fall back cleanly or skip the PDF instead of killing ingest. |
+
+### Example `.env`
+
 ```env
 OPENAI_BASE_URL=https://openrouter.ai/api/v1
 OPENAI_API_KEY=sk-or-xxxx
 MODEL=google/gemma-3n-e4b-it
 
-EMBED_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2
 INDEX_DIR=index
 INDEX_PATH=index/faiss.index
 META_PATH=index/meta.pkl
-RANK_FILE=data/nttv rank requirements.txt
+
+ENABLE_PDF_INGEST=true
+PDF_PARSER=docling
+PDF_PARSE_MAX_PAGES=
+PDF_FAIL_OPEN=true
 
 TOP_K=6
 TEMPERATURE=0.0
@@ -159,192 +149,131 @@ MAX_TOKENS=512
 STREAMLIT_BROWSER_GATHERUSAGESTATS=false
 ```
 
-> Do **not** commit `.env` or real secrets to git.
+## Build the Index
 
----
-
-## 🧪 Build the Index & Run Streamlit
-
-### Build / Rebuild FAISS
 ```bash
 python ingest.py
 ```
-Writes:
-- `index/faiss.index` **and** `index/index.faiss`
-- `index/meta.pkl`
-- `index/config.json`
 
-### Run the Streamlit UI
+The ingest run now prints:
+- parser settings
+- per-file parser used
+- per-file element counts
+- skipped file reasons
+
+### Output Metadata
+
+Each chunk in `index/meta.pkl` still preserves the existing keys used by the app:
+- `text`
+- `source`
+- `meta.priority`
+- `meta.source`
+
+Structured ingest adds these metadata fields when available:
+- `meta.parser`
+- `meta.file_type`
+- `meta.page`
+- `meta.page_start`
+- `meta.page_end`
+- `meta.heading_path`
+- `meta.element_type`
+- `meta.raw_metadata`
+
+`index/config.json` now also records:
+- `files`
+- `skipped_files`
+- `parsing`
+
+## PDF Support
+
+Place PDFs in `data/` and run:
+
+```bash
+python ingest.py
+```
+
+Behavior:
+- If Docling is installed and PDF ingest is enabled, PDFs are parsed structurally.
+- If `PDF_FAIL_OPEN=true` and Docling fails for a PDF, ingest falls back to `pypdf` when possible.
+- If a PDF still cannot be parsed, that file is skipped and the rest of ingest continues.
+- `.txt` and `.md` ingestion remains unchanged in behavior, just routed through the shared parser interface.
+
+## Run the App
+
+### Streamlit
+
 ```bash
 streamlit run app.py
 ```
+
 Open `http://localhost:8501`.
 
----
+### FastAPI
 
-## Accessing the NTTV Chatbot API (Local)
-
-This repo includes a small **FastAPI** server (`api_server.py`) so you can hit the RAG pipeline over HTTP, plus a minimal **vanilla HTML** test page (`nttv_test.html`) for quick UI testing.
-
-### Prereqs
-- Python 3.11.x
-- A virtualenv with project deps installed
-- Index artifacts built (`python ingest.py`)
-
-> Tip: Always run Python commands **inside your venv**.
-
-```powershell
-# Windows / PowerShell
-.\.venv\Scripts\Activate.ps1
-python -m pip install -U pip
-python -m pip install fastapi uvicorn[standard] pydantic
-```
-
----
-
-### 1) Launch the API server (FastAPI)
-
-```powershell
-# From repo root, with venv active
-# Optional: set an API key for local auth (omit if you don't want auth)
-$env:NTTV_API_KEY = "dev-local-key"
-
-# Start the API on 127.0.0.1:8000 (reload on file changes)
+```bash
 python -m uvicorn api_server:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-**Health check:**
+Health check:
+
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/healthz
 ```
 
-**Query example (PowerShell):**
-```powershell
-# Without API key
-Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post -ContentType 'application/json' -Body '{"query":"When do I learn kusari-fundo?"}'
+## Deploying to Render
 
-# With API key
-Invoke-RestMethod -Uri http://127.0.0.1:8000/query -Method Post -ContentType 'application/json' -Headers @{ 'X-API-Key' = $env:NTTV_API_KEY } -Body '{"query":"When do I learn kusari-fundo?"}'
+Base build:
+
+```bash
+python -m pip install -U pip && pip install -r requirements.txt && python ingest.py
 ```
 
-**Query example (curl.exe):**
-```bat
-curl.exe -s -H "Content-Type: application/json" ^
-  -H "X-API-Key: dev-local-key" ^
-  -d "{\"query\":\"When do I learn kusari-fundo?\"}" ^
-  http://127.0.0.1:8000/query
+If you want structured PDF ingestion on Render too, make sure Docling is installed in that build environment before `python ingest.py` runs.
+
+Suggested start command:
+
+```bash
+streamlit run app.py --server.port $PORT --server.address 0.0.0.0
 ```
 
-**Response shape:**
-```json
-{
-  "answer": "string",
-  "sources": [
-    { "source": "file.md", "page": null, "snippet": "…", "score": 0.43 }
-  ],
-  "det_path": "deterministic/kihon",
-  "meta": {
-    "model": "google/gemma-3n-e4b-it",
-    "retrieval_count": 6,
-    "elapsed_ms": 812
-  }
-}
+## Troubleshooting
+
+### Index/meta mismatch
+
+- Rebuild with `python ingest.py`
+- Make sure `index.faiss` and `meta.pkl` came from the same ingest run
+
+### PDF files are being skipped
+
+- Install Docling with `pip install docling==2.88.0`
+- Or set `ENABLE_PDF_INGEST=true` and `PDF_PARSER=pypdf`
+- Check the skipped-file reasons printed by `ingest.py`
+
+### Docling is installed but ingest is slow
+
+- Try `PDF_PARSE_MAX_PAGES=25` for a bounded first pass
+- Use `PDF_PARSER=pypdf` if you want a lighter-weight fallback-only mode
+
+### LLM errors
+
+- Check `OPENAI_API_KEY`
+- Check `OPENAI_BASE_URL`
+- Check `MODEL`
+
+## Tests
+
+Run the full suite:
+
+```bash
+pytest
 ```
 
-> **CORS:** `api_server.py` ships with dev-friendly CORS (wide-open). For production, restrict `allow_origins` to your site domain.
+Run just the parsing tests:
 
----
-
-### 2) Launch the minimal test webpage (no framework)
-
-We ship a tiny, framework-free test page: `nttv_test.html`. Serve it locally to avoid `file://` CORS issues.
-
-```powershell
-# In the folder containing nttv_test.html
-python -m http.server 5500
-# Open in your browser:
-# http://127.0.0.1:5500/nttv_test.html
+```bash
+pytest tests/test_document_parsing.py
 ```
 
-**Point the page at your API (one-time):**  
-Open the browser DevTools **Console** on `nttv_test.html` and run:
-```js
-localStorage.setItem("NTTV_API_BASE","http://127.0.0.1:8000");
-// If you set an API key when launching uvicorn, also set:
-localStorage.setItem("NTTV_API_KEY","dev-local-key");
-location.reload();
-```
+## License
 
-Now type a question in the page and you’ll see:
-- The assistant’s answer as a chat bubble
-- A **Deterministic** badge when a rule-based extractor answered
-- Numbered citations (sources + snippets)
-- Basic timing in the metadata line
-
----
-
-## ☁️ Deploying to Render
-
-1) Ensure `render.yaml` is at the repo root (Blueprint).  
-2) In Render:
-   - New → **Blueprint** → connect repo.
-   - `buildCommand`:
-     ```bash
-     python -m pip install -U pip && pip install -r requirements.txt && python ingest.py
-     ```
-   - `startCommand` (Streamlit):
-     ```bash
-     streamlit run app.py --server.port $PORT --server.address 0.0.0.0
-     ```
-   - Set env vars in the dashboard:
-     - `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `MODEL`
-     - `INDEX_DIR`, `INDEX_PATH`, `META_PATH` (if you override)
-     - Optional: `TRANSFORMERS_CACHE`, `SENTENCE_TRANSFORMERS_HOME` on persistent disk
-   - Mount a persistent disk for `/var/data/index` if desired; point `INDEX_DIR` there.
-
-> Free tiers are RAM-limited; for larger corpora, pick a plan with ≥2 GB RAM.
-
----
-
-## 🔧 Troubleshooting
-
-**“Index/meta mismatch” or retrieval errors**
-- Rebuild: delete `index/` and run `python ingest.py`  
-- Ensure **counts match** in `config.json` and sidebar diagnostics.
-
-**CORS blocked in browser**
-- Use the served page (`http://127.0.0.1:5500/...`).
-- Keep dev CORS in `api_server.py`; restrict origins for production.
-
-**401 Unauthorized**
-- You started uvicorn with `NTTV_API_KEY`. Send `X-API-Key` from the client or unset the env var and restart.
-
-**LLM errors (401/403/429)**
-- Check `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `MODEL`.
-
-**Slow or 5xx on Render**
-- Free tier may sleep; cold starts add latency.
-- Upgrade to more RAM/CPU if you see restarts or OOM.
-
----
-
-## 🧭 Roadmap
-- Add deterministic extractor for **Kyusho** (expanded).
-- Optional HNSW index (env-gated) for faster retrieval at scale.
-- SSE/WebSocket streaming endpoint for token-by-token UX.
-- Simple `deploy.sh` for VPS targets.
-- Expand prompt harness with rank/weapons technique cases.
-
----
-
-## 📜 License & Credits
-
-**License:** MIT
-
-**Built with:**
-- Streamlit  
-- FAISS  
-- Sentence-Transformers  
-- OpenRouter-compatible APIs  
-- NTTV curriculum (Bujinkan-focused content)
-
+MIT
