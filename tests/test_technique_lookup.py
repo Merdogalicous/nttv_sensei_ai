@@ -1,4 +1,5 @@
 import pathlib
+
 from extractors.techniques import try_answer_technique
 
 TECH = pathlib.Path("data") / "Technique Descriptions.md"
@@ -15,13 +16,10 @@ def _passages():
 
 
 def test_omote_gyaku_fields_present():
-    q = "what is Omote Gyaku"
-    ans = try_answer_technique(q, _passages())
-    assert isinstance(ans, str) and ans.strip()
-    low = ans.lower()
-    # Structured fields from the technique extractor
-    assert "translation" in low
-    assert "type" in low
-    assert "rank intro" in low
-    assert "definition" in low
-    assert "wrist" in low or "joint" in low
+    ans = try_answer_technique("what is Omote Gyaku", _passages())
+    assert ans and ans.answer_type == "technique"
+    assert ans.facts["technique_name"].lower() == "omote gyaku"
+    assert ans.facts["translation"]
+    assert ans.facts["type"]
+    assert ans.facts["rank_context"]
+    assert "wrist" in ans.facts["definition"].lower() or "joint" in ans.facts["definition"].lower()

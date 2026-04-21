@@ -3,6 +3,8 @@ from typing import List, Dict, Any, Optional, Tuple
 import re
 import os
 
+from nttv_chatbot.deterministic import DeterministicResult, build_result
+
 # ----------------------------
 # Canonical names + aliases
 # ----------------------------
@@ -282,7 +284,7 @@ def try_answer_schools_list(
     passages: List[Dict[str, Any]],
     *,
     bullets: bool = True,
-) -> Optional[str]:
+) -> Optional[DeterministicResult]:
     """Return a list of the nine schools, if the question asks for the list."""
     if not is_school_list_query(question):
         return None
@@ -322,20 +324,26 @@ def try_answer_schools_list(
         order_map = {n.lower(): i for i, n in enumerate(canonical_order)}
         names.sort(key=lambda s: order_map.get(s.lower(), 999))
 
-    title = "The Nine Schools of the Bujinkan"
-    if bullets:
-        out = [f"{title}:"]
-        for n in names:
-            out.append(f"- {n}")
-        return "\n".join(out)
-    return f"{title}: " + ", ".join(names) + "."
+    return build_result(
+        det_path="schools/list",
+        answer_type="school_list",
+        facts={
+            "list_title": "The Nine Schools of the Bujinkan",
+            "school_names": names,
+        },
+        passages=passages,
+        preferred_sources=["Schools of the Bujinkan Summaries.txt"],
+        confidence=0.97,
+        display_hints={"explain": True},
+        followup_suggestions=["Ask about one school if you want a short profile."],
+    )
 
 def try_answer_school_profile(
     question: str,
     passages: List[Dict[str, Any]],
     *,
     bullets: bool = True,
-) -> Optional[str]:
+) -> Optional[DeterministicResult]:
     """
     Return a compact profile for a single school (Translation / Type / Focus / Weapons / Notes).
 
@@ -382,4 +390,20 @@ def try_answer_school_profile(
     if not fields:
         return None
 
-    return _format_profile(canon, fields, bullets=bullets)
+    return build_result(
+        det_path="schools/profile",
+        answer_type="school_profile",
+        facts={
+            "school_name": canon,
+            "translation": fields.get("translation"),
+            "type": fields.get("type"),
+            "focus": fields.get("focus"),
+            "weapons": fields.get("weapons"),
+            "notes": fields.get("notes"),
+        },
+        passages=passages,
+        preferred_sources=["Schools of the Bujinkan Summaries.txt"],
+        confidence=0.95,
+        display_hints={"explain": True},
+        followup_suggestions=["Ask for the other Bujinkan schools if you want the full list."],
+    )

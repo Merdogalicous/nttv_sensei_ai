@@ -14,6 +14,8 @@ import os
 import re
 from typing import List, Dict, Any, Optional
 
+from nttv_chatbot.deterministic import DeterministicResult, build_result
+
 
 # ----------------------------
 # Static texts for special cases
@@ -59,6 +61,42 @@ SHURIKEN_TYPES_TEXT = (
     "   - If it fits in the hand, can be controlled, and can pierce or distract, "
     "you can train it as shuriken."
 )
+
+_KATANA_PARTS = [
+    {"term": "Tsuka", "description": "handle"},
+    {"term": "Tsuka Kishiri", "description": "handle endcap"},
+    {"term": "Saya", "description": "sheath"},
+    {"term": "Sageo", "description": "cord for the sheath"},
+    {"term": "Tsuba", "description": "handguard"},
+    {"term": "Ha", "description": "blade edge"},
+    {"term": "Hi", "description": "blood gutter"},
+    {"term": "Hamon", "description": "temper line"},
+    {"term": "Mune", "description": "back of the sword"},
+    {"term": "Kissaki", "description": "the tip or point area that has a ridgeline"},
+]
+
+_SHURIKEN_TYPES = [
+    {
+        "name": "Bo-shuriken",
+        "description": "Straight spike, like a needle, dart, or large nail, commonly thrown with a single spin.",
+    },
+    {
+        "name": "Hira-shuriken",
+        "description": "Flat bladed forms, the classic throwing-star style, typically thrown with slicing rotation.",
+    },
+    {
+        "name": "Senban-shuriken",
+        "description": "Square four-point subtype of hira-shuriken that can be thrown or set as a trap.",
+    },
+    {
+        "name": "Needle / hari-gata shuriken",
+        "description": "Very thin needle-like forms used for precise, stealthy insertion.",
+    },
+    {
+        "name": "Modern improvised throwing tools",
+        "description": "Items such as chopsticks, pens, nails, and hex keys trained as shuriken-like tools.",
+    },
+]
 
 
 # ----------------------------
@@ -174,17 +212,29 @@ def _find_weapon_row(question: str, rows: List[Dict[str, str]]) -> Optional[Dict
 # Public extractor functions
 # ----------------------------
 
-def try_answer_katana_parts(question: str, passages: List[Dict[str, Any]]) -> Optional[str]:
+def try_answer_katana_parts(question: str, passages: List[Dict[str, Any]]) -> Optional[DeterministicResult]:
     """Answer questions about the parts / terminology of the katana."""
     q = _norm(question)
     if "katana" not in q:
         return None
     if "part" in q or "terminology" in q or "terms" in q or "name" in q:
-        return KATANA_PARTS_TEXT
+        return build_result(
+            det_path="weapons/katana_parts",
+            answer_type="weapon_parts",
+            facts={
+                "title": "Parts of the katana",
+                "weapon_name": "Katana",
+                "parts": list(_KATANA_PARTS),
+            },
+            passages=passages,
+            preferred_sources=["NTTV Weapons Reference.txt"],
+            confidence=0.98,
+            display_hints={"explain": True},
+        )
     return None
 
 
-def try_answer_weapon_profile(question: str, passages: List[Dict[str, Any]]) -> Optional[str]:
+def try_answer_weapon_profile(question: str, passages: List[Dict[str, Any]]) -> Optional[DeterministicResult]:
     """
     Return a structured weapon profile for questions like:
     - "What is the hanbo weapon?"
@@ -195,7 +245,19 @@ def try_answer_weapon_profile(question: str, passages: List[Dict[str, Any]]) -> 
 
     # Special case: shuriken classification (types of shuriken)
     if "shuriken" in q and ("type" in q or "types" in q or "kind" in q or "kinds" in q):
-        return SHURIKEN_TYPES_TEXT
+        return build_result(
+            det_path="weapons/shuriken_types",
+            answer_type="weapon_classification",
+            facts={
+                "title": "Types of shuriken",
+                "weapon_name": "Shuriken",
+                "items": list(_SHURIKEN_TYPES),
+            },
+            passages=passages,
+            preferred_sources=["NTTV Weapons Reference.txt"],
+            confidence=0.97,
+            display_hints={"explain": True},
+        )
 
     rows = _parse_weapon_blocks(passages)
     if not rows:
@@ -212,24 +274,26 @@ def try_answer_weapon_profile(question: str, passages: List[Dict[str, Any]]) -> 
     ranks = row.get("RANKS", "").strip()
     notes = row.get("NOTES", "").strip()
 
-    parts: List[str] = []
-    parts.append(f"{name} weapon profile:")
-    if typ:
-        parts.append(f"Type: {typ}.")
-    if kamae:
-        parts.append(f"Kamae: {kamae}.")
-    if core:
-        # Tests expect the exact phrase "core actions include"
-        parts.append(f"Core actions include: {core}.")
-    if ranks:
-        parts.append(f"Ranks: {ranks}.")
-    if notes:
-        parts.append(f"Notes: {notes}.")
+    return build_result(
+        det_path="weapons/profile",
+        answer_type="weapon_profile",
+        facts={
+            "weapon_name": name,
+            "weapon_type": typ,
+            "kamae": [item.strip() for item in re.split(r"[;,]", kamae) if item.strip()] if kamae else [],
+            "core_actions": [item.strip() for item in re.split(r"[;,]", core) if item.strip()] if core else [],
+            "rank_context": ranks,
+            "notes": notes,
+        },
+        passages=passages,
+        preferred_sources=["NTTV Weapons Reference.txt"],
+        confidence=0.95,
+        display_hints={"explain": True},
+        followup_suggestions=["Ask when this weapon is introduced if you want the rank only."],
+    )
 
-    return " ".join(parts)
 
-
-def try_answer_weapon_rank(question: str, passages: List[Dict[str, Any]]) -> Optional[str]:
+def try_answer_weapon_rank(question: str, passages: List[Dict[str, Any]]) -> Optional[DeterministicResult]:
     """
     Answer questions like:
     - "At what rank do I learn kusari fundo?"
@@ -259,4 +323,16 @@ def try_answer_weapon_rank(question: str, passages: List[Dict[str, Any]]) -> Opt
     else:
         pretty = ranks
 
-    return f"You first study {name} at {pretty}."
+    return build_result(
+        det_path="weapons/rank",
+        answer_type="weapon_rank",
+        facts={
+            "weapon_name": name,
+            "rank_context": pretty,
+        },
+        passages=passages,
+        preferred_sources=["NTTV Weapons Reference.txt"],
+        confidence=0.98,
+        display_hints={"explain": False},
+        followup_suggestions=["Ask for the full weapon profile if you want type, kamae, and core actions too."],
+    )

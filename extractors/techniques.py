@@ -1,202 +1,159 @@
 from __future__ import annotations
+
 import os
 import re
 import unicodedata
 from difflib import SequenceMatcher
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
-# Optional indexed helpers (kept — only used if available)
+from nttv_chatbot.deterministic import DeterministicResult, build_result
+
 try:
-    from .technique_loader import parse_technique_md, build_indexes
-except Exception:
+    from .technique_loader import build_indexes, parse_technique_md
+except Exception:  # pragma: no cover - optional compatibility path
     parse_technique_md = None
     build_indexes = None
 
-# Questions that should NOT be treated as single-technique lookups
-CONCEPT_BANS = ("kihon happo", "kihon happō", "sanshin", "school", "schools", "ryu", "ryū")
 
-# Light heuristics to spot single-technique queries
+CONCEPT_BANS = ("kihon happo", "kihon happo", "sanshin", "school", "schools", "ryu", "ryu")
 TRIGGERS = ("what is", "define", "explain", "describe")
 NAME_HINTS = (
-    "gyaku","dori","kudaki","gatame","otoshi","nage","seoi","kote",
-    "musha","take ori","juji","omote","ura","ganseki","hodoki",
-    "kata","no kata"
+    "gyaku",
+    "dori",
+    "kudaki",
+    "gatame",
+    "otoshi",
+    "nage",
+    "seoi",
+    "kote",
+    "musha",
+    "take ori",
+    "juji",
+    "omote",
+    "ura",
+    "ganseki",
+    "hodoki",
+    "kata",
+    "no kata",
 )
+EXPECTED_COLS = 12
 
-# Our CSV-like single-line schema (last field absorbs commas)
-EXPECTED_COLS = 12  # name, japanese, translation, type, rank, in_rank, primary_focus,
-                    # safety, partner_required, solo, tags, description
 
-# ------------------------- utilities -------------------------
+def _norm_space(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
 
-def _norm_space(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
 
-def _fold(s: str) -> str:
-    """Lowercase + strip macrons/diacritics."""
-    if not s:
+def _fold(text: str) -> str:
+    if not text:
         return ""
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return s.lower()
+    normalized = unicodedata.normalize("NFKD", text)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return normalized.lower()
 
-def _lite(s: str) -> str:
-    """Alnum only for tolerant matching."""
-    return re.sub(r"[^a-z0-9]+", "", _fold(s))
+
+def _lite(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _fold(text))
+
 
 def _same_source_name(p_source: str, target_name: str) -> bool:
-    """
-    Compare FAISS/meta 'source' values (which may include paths) with the
-    logical filename used by the extractor. Basename + lowercase.
-    """
     if not p_source:
         return False
-    base_actual = os.path.basename(p_source).lower()
-    base_target = os.path.basename(target_name).lower()
-    return base_actual == base_target
+    return os.path.basename(p_source).lower() == os.path.basename(target_name).lower()
 
-def _looks_like_technique_q(q: str) -> bool:
-    ql = _norm_space(q).lower()
-    if any(b in ql for b in CONCEPT_BANS):
+
+def _looks_like_technique_q(question: str) -> bool:
+    ql = _norm_space(question).lower()
+    if any(banned in ql for banned in CONCEPT_BANS):
         return False
-    if any(t in ql for t in TRIGGERS):
+    if any(trigger in ql for trigger in TRIGGERS):
         return True
-    # short, name-like things (e.g., “omote gyaku”, “jumonji no kata”)
-    if len(ql.split()) <= 7 and any(h in ql for h in NAME_HINTS):
-        return True
-    return False
+    return len(ql.split()) <= 7 and any(hint in ql for hint in NAME_HINTS)
+
 
 def _gather_full_technique_text(passages: List[Dict[str, Any]]) -> str:
-    """Concatenate only Technique Descriptions docs."""
-    buf = []
-    for p in passages:
-        src_raw = p.get("source") or ""
+    parts: list[str] = []
+    for passage in passages:
+        src_raw = passage.get("source") or ""
         src = src_raw.lower()
         if _same_source_name(src_raw, "Technique Descriptions.md") or "technique descriptions" in src:
-            buf.append(p.get("text", ""))
-    return "\n".join(buf)
+            parts.append(passage.get("text", ""))
+    return "\n".join(parts)
 
-def _extract_candidate(ql: str) -> str:
-    """
-    Pull the thing after 'what is|define|explain|describe' … else return ql.
 
-    This keeps the candidate clean so 'describe Oni Kudaki' becomes just
-    'Oni Kudaki' for matching against Technique Descriptions.
-    """
-    m = re.search(
-        r"(?:what\s+is|define|explain|describe)\s+(.+)$",
-        ql,
-        flags=re.I,
-    )
-    cand = (m.group(1) if m else ql).strip().rstrip("?!.")
-    cand = re.sub(
-        r"\b(technique|in ninjutsu|in bujinkan)\b",
-        "",
-        cand,
-        flags=re.I,
-    ).strip()
-    return cand
+def _extract_candidate(question_text: str) -> str:
+    match = re.search(r"(?:what\s+is|define|explain|describe)\s+(.+)$", question_text, flags=re.I)
+    candidate = (match.group(1) if match else question_text).strip().rstrip("?!.")
+    candidate = re.sub(r"\b(technique|in ninjutsu|in bujinkan)\b", "", candidate, flags=re.I).strip()
+    return candidate
+
 
 def _candidate_variants(raw: str) -> List[str]:
-    """Generate robust name variants: +/- 'no kata', hyphen/space, folded/lite."""
-    v: List[str] = []
+    variants: list[str] = []
     raw = _norm_space(raw)
-    v.append(raw)
-
-    # +/- 'no kata'
+    variants.append(raw)
     if raw.lower().endswith(" no kata"):
-        v.append(raw[:-8].strip())
+        variants.append(raw[:-8].strip())
     else:
-        v.append(f"{raw} no kata")
+        variants.append(f"{raw} no kata")
 
-    # Hyphen-insensitive
-    raw_no_hy = raw.replace("-", " ")
-    if raw_no_hy != raw:
-        v.append(raw_no_hy)
-        if raw_no_hy.lower().endswith(" no kata"):
-            v.append(raw_no_hy[:-8].strip())
+    raw_no_hyphen = raw.replace("-", " ")
+    if raw_no_hyphen != raw:
+        variants.append(raw_no_hyphen)
+        if raw_no_hyphen.lower().endswith(" no kata"):
+            variants.append(raw_no_hyphen[:-8].strip())
         else:
-            v.append(f"{raw_no_hy} no kata")
+            variants.append(f"{raw_no_hyphen} no kata")
 
-    # Folded and “lite” forms
-    v.append(_fold(raw))
-    v.append(_lite(raw))
+    variants.append(_fold(raw))
+    variants.append(_lite(raw))
 
-    # De-duplicate, preserve order
-    seen = set(); out = []
-    for x in v:
-        if x not in seen:
-            out.append(x); seen.add(x)
-    return out
+    seen: set[str] = set()
+    output: list[str] = []
+    for item in variants:
+        if item not in seen:
+            output.append(item)
+            seen.add(item)
+    return output
 
-def _fmt_bool(v: Optional[bool]) -> str:
-    if v is True: return "Yes"
-    if v is False: return "No"
-    return "—"
-
-def _format_bullets(rec: Dict[str, Any]) -> str:
-    """Consistent, compact bullet formatting."""
-    name = rec.get("name") or "Technique"
-    translation = rec.get("translation") or ""
-    typ = rec.get("type") or ""
-    rank = rec.get("rank") or ""
-    focus = rec.get("primary_focus") or ""
-    safety = rec.get("safety") or rec.get("difficulty") or ""
-    partner = _fmt_bool(rec.get("partner_required"))
-    solo = _fmt_bool(rec.get("solo"))
-    desc = (rec.get("description") or "").strip()
-
-    lines = [f"{name}:"]
-    if translation:     lines.append(f"- Translation: {translation}")
-    if typ:             lines.append(f"- Type: {typ}")
-    if rank:            lines.append(f"- Rank intro: {rank}")
-    if focus:           lines.append(f"- Focus: {focus}")
-    if safety:          lines.append(f"- Safety: {safety}")
-    if partner != "—":  lines.append(f"- Partner required: {partner}")
-    if solo != "—":     lines.append(f"- Solo: {solo}")
-    lines.append(f"- Definition: {desc if desc else '(not listed).'}")
-    return "\n".join(lines)
-
-# ------------------------- CSV helpers -------------------------
 
 def _iter_csv_like_lines(md_text: str):
-    """Yield non-empty, non-heading lines that contain commas."""
     for raw in (md_text or "").splitlines():
-        st = raw.strip()
-        if not st:
+        stripped = raw.strip()
+        if not stripped:
             continue
-        if st.startswith("#") or st.startswith("```"):
+        if stripped.startswith("#") or stripped.startswith("```"):
             continue
         if "," in raw:
             yield raw
 
+
 def _split_row_limited(raw: str) -> List[str]:
-    """
-    Split a CSV-like row into EXPECTED_COLS pieces.
-    The last field absorbs the remaining commas (so descriptions with commas are safe).
-    """
     parts = raw.split(",", EXPECTED_COLS - 1)
-    parts = [p.strip() for p in parts]
+    parts = [part.strip() for part in parts]
     if len(parts) > EXPECTED_COLS:
-        head = parts[:EXPECTED_COLS-1]
-        tail = ",".join(parts[EXPECTED_COLS-1:])
-        parts = head + [tail]
+        parts = parts[: EXPECTED_COLS - 1] + [",".join(parts[EXPECTED_COLS - 1 :])]
     if len(parts) < EXPECTED_COLS:
         parts += [""] * (EXPECTED_COLS - len(parts))
     return parts
 
+
 def _scan_csv_rows_limited(md_text: str) -> List[List[str]]:
     return [_split_row_limited(raw) for raw in _iter_csv_like_lines(md_text)]
 
-def _has_header(cells: List[str]) -> bool:
-    header = [c.strip().lower() for c in cells]
-    return any(h in {"name","translation","japanese","description"} for h in header)
 
-def _to_bool(x: str) -> Optional[bool]:
-    v = (x or "").strip().lower()
-    if v in {"1","true","yes","y","✅","✓","✔"}: return True
-    if v in {"0","false","no","n","❌","✗","✕"}: return False
+def _has_header(cells: List[str]) -> bool:
+    lowered = [cell.strip().lower() for cell in cells]
+    return any(item in {"name", "translation", "japanese", "description"} for item in lowered)
+
+
+def _to_bool(value: str) -> Optional[bool]:
+    lowered = (value or "").strip().lower()
+    if lowered in {"1", "true", "yes", "y", "✅", "✓", "✔"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "❌", "✗", "✕"}:
+        return False
     return None
+
 
 def _row_to_record_positional(row: List[str]) -> Dict[str, Any]:
     return {
@@ -214,15 +171,9 @@ def _row_to_record_positional(row: List[str]) -> Dict[str, Any]:
         "description": row[11],
     }
 
-# ---------------------- NEW: direct line lookup ----------------------
 
 def _direct_line_lookup(md_text: str, cand_variants: List[str]) -> Optional[Dict[str, Any]]:
-    """
-    Exactly match the first cell (technique name) of a CSV line against
-    name variants (case/macrón-insensitive). Fast and robust for your
-    single-line-per-technique markdown.
-    """
-    anchors = {_fold(v) for v in cand_variants if v and not v.startswith("#")}
+    anchors = {_fold(value) for value in cand_variants if value and not value.startswith("#")}
     if not anchors:
         return None
 
@@ -232,11 +183,9 @@ def _direct_line_lookup(md_text: str, cand_variants: List[str]) -> Optional[Dict
             continue
         first = line.split(",", 1)[0].strip()
         if _fold(first) in anchors:
-            row = _split_row_limited(line)
-            return _row_to_record_positional(row)
+            return _row_to_record_positional(_split_row_limited(line))
     return None
 
-# ------------------------- CSV table fallback -------------------------
 
 def _csv_fallback_lookup(md_text: str, cand_variants: List[str]) -> Optional[Dict[str, Any]]:
     rows = _scan_csv_rows_limited(md_text)
@@ -245,39 +194,65 @@ def _csv_fallback_lookup(md_text: str, cand_variants: List[str]) -> Optional[Dic
 
     has_header = _has_header(rows[0])
     data_rows = rows[1:] if has_header else rows
+    cand_folded = [_fold(item) for item in cand_variants]
+    cand_lite = [_lite(item) for item in cand_variants]
 
-    cand_folded = [_fold(c) for c in cand_variants]
-    cand_lite = [_lite(c) for c in cand_variants]
-
-    # 1) exact-ish key hits
-    for r in data_rows:
-        if not r or not r[0].strip():
+    for row in data_rows:
+        if not row or not row[0].strip():
             continue
-        name = r[0].strip()
-        name_fold = _fold(name)
-        name_lite = _lite(name)
-        if name_fold in cand_folded or name_lite in cand_lite:
-            return _row_to_record_positional(r)
+        name = row[0].strip()
+        if _fold(name) in cand_folded or _lite(name) in cand_lite:
+            return _row_to_record_positional(row)
 
-    # 2) fuzzy best match (high threshold to avoid wrong hits)
-    best = (None, 0.0)
+    best_row: Optional[List[str]] = None
+    best_score = 0.0
     target = _fold(cand_variants[0]) if cand_variants else ""
-    for r in data_rows:
-        name = (r[0] or "").strip()
+    for row in data_rows:
+        name = (row[0] or "").strip()
         if not name:
             continue
-        s = SequenceMatcher(None, _fold(name), target).ratio()
-        if s > best[1]:
-            best = (r, s)
-
-    if best[0] is not None and best[1] >= 0.85:
-        return _row_to_record_positional(best[0])
+        score = SequenceMatcher(None, _fold(name), target).ratio()
+        if score > best_score:
+            best_row = row
+            best_score = score
+    if best_row is not None and best_score >= 0.85:
+        return _row_to_record_positional(best_row)
     return None
 
-# ---------------------- public entrypoint ----------------------
 
-def try_answer_technique(question: str, passages: List[Dict[str, Any]]) -> Optional[str]:
-    """Return a structured technique answer or None to fall back upstream."""
+def _record_to_result(
+    rec: Dict[str, Any],
+    passages: List[Dict[str, Any]],
+    *,
+    det_path: str,
+) -> DeterministicResult:
+    tags_raw = rec.get("tags") or ""
+    tags = [item.strip() for item in str(tags_raw).split(",") if item.strip()]
+    return build_result(
+        det_path=det_path,
+        answer_type="technique",
+        facts={
+            "technique_name": rec.get("name"),
+            "japanese": rec.get("japanese"),
+            "translation": rec.get("translation"),
+            "type": rec.get("type"),
+            "rank_context": rec.get("rank"),
+            "primary_focus": rec.get("primary_focus"),
+            "safety": rec.get("safety"),
+            "partner_required": rec.get("partner_required"),
+            "solo": rec.get("solo"),
+            "tags": tags,
+            "definition": rec.get("description"),
+        },
+        passages=passages,
+        preferred_sources=["Technique Descriptions.md"],
+        confidence=0.95,
+        display_hints={"explain": True},
+        followup_suggestions=["Ask how it compares with another technique if you want a side-by-side answer."],
+    )
+
+
+def try_answer_technique(question: str, passages: List[Dict[str, Any]]) -> Optional[DeterministicResult]:
     if not _looks_like_technique_q(question):
         return None
 
@@ -289,17 +264,14 @@ def try_answer_technique(question: str, passages: List[Dict[str, Any]]) -> Optio
     cand_raw = _extract_candidate(ql)
     variants = _candidate_variants(cand_raw)
 
-    # 1) Direct line lookup (most reliable for your CSV-like .md format)
     rec = _direct_line_lookup(md_text, variants)
     if rec:
-        return _format_bullets(rec)
+        return _record_to_result(rec, passages, det_path="technique/single")
 
-    # 2) CSV table lookup
     rec = _csv_fallback_lookup(md_text, variants)
     if rec:
-        return _format_bullets(rec)
+        return _record_to_result(rec, passages, det_path="technique/core")
 
-    # 3) Optional indexed route (kept for compatibility)
     if parse_technique_md and build_indexes:
         try:
             records = parse_technique_md(md_text)
@@ -307,29 +279,31 @@ def try_answer_technique(question: str, passages: List[Dict[str, Any]]) -> Optio
         except Exception:
             idx = None
         if idx:
-            by_name = idx["by_name"]; by_lower = idx["by_lower"]
-            by_fold = idx["by_fold"]; by_key = idx["by_keylite"]
+            by_name = idx["by_name"]
+            by_lower = idx["by_lower"]
+            by_fold = idx["by_fold"]
+            by_key = idx["by_keylite"]
 
-            # Direct dictionary hits
-            for v in variants:
-                key = v.lower()
+            for variant in variants:
+                key = variant.lower()
                 if key in by_lower:
-                    return _format_bullets(by_name[by_lower[key]])
-                fkey = _fold(v)
-                if fkey in by_fold:
-                    return _format_bullets(by_name[by_fold[fkey]])
-                lkey = _lite(v)
-                if lkey in by_key:
-                    return _format_bullets(by_name[by_key[lkey]])
+                    return _record_to_result(by_name[by_lower[key]], passages, det_path="technique/core")
+                folded_key = _fold(variant)
+                if folded_key in by_fold:
+                    return _record_to_result(by_name[by_fold[folded_key]], passages, det_path="technique/core")
+                lite_key = _lite(variant)
+                if lite_key in by_key:
+                    return _record_to_result(by_name[by_key[lite_key]], passages, det_path="technique/core")
 
-            # Fuzzy across names
             cq = _fold(cand_raw)
-            best_name, best_score = None, 0.0
+            best_name: Optional[str] = None
+            best_score = 0.0
             for name in by_name.keys():
-                s = SequenceMatcher(None, _fold(name), cq).ratio()
-                if s > best_score:
-                    best_name, best_score = name, s
+                score = SequenceMatcher(None, _fold(name), cq).ratio()
+                if score > best_score:
+                    best_name = name
+                    best_score = score
             if best_name and best_score >= 0.80:
-                return _format_bullets(by_name[best_name])
+                return _record_to_result(by_name[best_name], passages, det_path="technique/core")
 
     return None

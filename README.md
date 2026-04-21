@@ -17,6 +17,7 @@ The stack centers on:
 - Optional Docling-backed PDF ingestion with page-aware and heading-aware metadata.
 - Section-aware, metadata-rich chunking with stable chunk IDs and token-based controls.
 - Hybrid retrieval with FAISS dense search, BM25 lexical search, RRF fusion, and optional reranking.
+- Structured deterministic extractors plus a local composer so known-known answers stay correct but sound more natural.
 
 ## Architecture
 
@@ -62,6 +63,24 @@ Chunking:
 - optionally reranks the fused shortlist with Jina and falls back safely to heuristic ordering
 - uses OpenRouter-compatible LLM calls for synthesis
 
+### Deterministic Answers
+
+Deterministic answers now flow through two explicit layers:
+- extractors return structured `DeterministicResult` objects instead of final prose
+- `nttv_chatbot/composer.py` turns those facts into brief, standard, or full natural-language answers without using an LLM
+
+The structured deterministic payload carries:
+- `answered`
+- `det_path`
+- `answer_type`
+- `facts`
+- `source_refs`
+- `confidence`
+- `display_hints`
+- `followup_suggestions`
+
+This keeps routing and factual correctness in the extractors while moving wording and pacing into one deterministic composition layer.
+
 ## Repository Structure
 
 ```text
@@ -75,6 +94,8 @@ nttv_chatbot_ext/
 |-- nttv_chatbot/
 |   |-- config.py
 |   |-- chunking.py
+|   |-- composer.py
+|   |-- deterministic.py
 |   |-- document_parsing.py
 |   |-- retrieval.py
 |   `-- llm_client.py
@@ -258,6 +279,7 @@ Debug mode in `app.py` now shows:
 - lexical candidates
 - fused candidates
 - reranked candidates
+- deterministic result payloads still include `det_path`, confidence, facts, and source refs in the raw debug JSON
 - stage scores when available
 
 ### Chunking Strategy
@@ -353,6 +375,8 @@ Run the full suite:
 pytest
 ```
 
+The deterministic extractor tests now validate structured fact payloads directly, and composer tests validate the local phrasing layer separately.
+
 Run just the parsing tests:
 
 ```bash
@@ -363,6 +387,12 @@ Run the chunking tests:
 
 ```bash
 pytest tests/test_chunking.py
+```
+
+Run the deterministic composer tests:
+
+```bash
+pytest tests/test_composer.py
 ```
 
 Run the retrieval tests:

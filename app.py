@@ -11,6 +11,8 @@ import streamlit as st
 from dotenv import load_dotenv
 load_dotenv()
 
+from nttv_chatbot.composer import compose_deterministic_answer
+from nttv_chatbot.deterministic import DeterministicResult, build_result
 from nttv_chatbot.retrieval import (
     LexicalRetriever,
     RetrievalResult,
@@ -37,7 +39,6 @@ from extractors.kihon_happo import try_answer_kihon_happo
 from extractors import try_extract_answer
 from extractors.leadership import try_extract_answer as try_leadership
 from extractors.weapons import try_answer_weapon_rank
-from extractors.rank import try_answer_rank_requirements
 from extractors.schools import (
     try_answer_school_profile,
     try_answer_schools_list,   # list extractor
@@ -834,54 +835,27 @@ def _parse_tech_csv_line(line: str) -> Optional[Dict[str, str]]:
     }
 
 
-def _render_single_technique(row: Dict[str, str], *, bullets: bool, tone: str, detail_mode: str) -> str:
-    """
-    Format a single technique into bullets or paragraph. 'detail_mode' in {"Brief","Standard","Full"}.
-    """
-    title  = row.get("name","Technique")
-    jp     = row.get("japanese","")
-    en     = row.get("english","")
-    family = row.get("family","")
-    rank   = row.get("rank_intro","")
-    focus  = row.get("focus","")
-    safety = row.get("safety","")
-    part   = row.get("partner_required","")
-    solo   = row.get("solo","")
-    tags   = row.get("tags","")
-    defin  = (row.get("definition") or "").strip()
+def _detail_style() -> str:
+    value = (TECH_DETAIL_MODE or "Standard").strip().lower()
+    if value not in {"brief", "standard", "full"}:
+        return "standard"
+    return value
 
-    if detail_mode == "Brief":
-        brief = [f"{title}:"]
-        if en:  brief.append(f"- English: {en}")
-        if jp:  brief.append(f"- Japanese: {jp}")
-        if defin: brief.append(f"- Definition: {defin if defin.endswith('.') else defin + '.'}")
-        body = "\n".join(brief)
 
-    elif detail_mode == "Standard":
-        std = [f"{title}:"]
-        if en:      std.append(f"- English: {en}")
-        if jp:      std.append(f"- Japanese: {jp}")
-        if family:  std.append(f"- Family: {family}")
-        if rank:    std.append(f"- Rank intro: {rank}")
-        if focus:   std.append(f"- Focus: {focus}")
-        if defin:   std.append(f"- Definition: {defin if defin.endswith('.') else defin + '.'}")
-        body = "\n".join(std)
+def _deterministic_output_format() -> str:
+    return "bullets" if output_style == "Bullets" else "paragraph"
 
-    else:  # Full
-        full = [f"{title}:"]
-        if jp:      full.append(f"- Japanese: {jp}")
-        if en:      full.append(f"- English: {en}")
-        if family:  full.append(f"- Family: {family}")
-        if rank:    full.append(f"- Rank intro: {rank}")
-        if focus:   full.append(f"- Focus: {focus}")
-        if safety:  full.append(f"- Safety: {safety}")
-        if part:    full.append(f"- Partner required: {part}")
-        if solo:    full.append(f"- Solo: {solo}")
-        if tags:    full.append(f"- Tags: {tags}")
-        if defin:   full.append(f"- Definition: {defin if defin.endswith('.') else defin + '.'}")
-        body = "\n".join(full)
 
-    return _render_det(body, bullets=bullets, tone=tone)
+def _compose_deterministic_result(result: DeterministicResult) -> Tuple[str, str]:
+    body = compose_deterministic_answer(
+        result,
+        style=_detail_style(),
+        output_format=_deterministic_output_format(),
+        explanation_mode=True,
+        tone=tone_style,
+    )
+    strict_label = "🔒 Strict (context-only, explain)" if result.display_hints.get("explain", True) else "🔒 Strict (context-only)"
+    return f"{strict_label}\n\n{body}", json.dumps(result.to_dict(), ensure_ascii=False)
 
 
 def answer_single_technique_if_synthetic(
@@ -890,7 +864,7 @@ def answer_single_technique_if_synthetic(
     bullets: bool,
     tone: str,
     detail_mode: str
-) -> Optional[str]:
+) -> Optional[DeterministicResult]:
     """
     If the first passage is our synthetic single-technique CSV line, parse & render it now.
     """
@@ -904,7 +878,28 @@ def answer_single_technique_if_synthetic(
     row = _parse_tech_csv_line(line)
     if not row:
         return None
-    return _render_single_technique(row, bullets=bullets, tone=tone, detail_mode=detail_mode)
+    tags_raw = row.get("tags") or ""
+    tags = [item.strip() for item in tags_raw.split(",") if item.strip()]
+    return build_result(
+        det_path="technique/single",
+        answer_type="technique",
+        facts={
+            "technique_name": row.get("name"),
+            "japanese": row.get("japanese"),
+            "translation": row.get("english"),
+            "type": row.get("family"),
+            "rank_context": row.get("rank_intro"),
+            "primary_focus": row.get("focus"),
+            "safety": row.get("safety"),
+            "partner_required": row.get("partner_required"),
+            "solo": row.get("solo"),
+            "tags": tags,
+            "definition": row.get("definition"),
+        },
+        preferred_sources=["Technique Descriptions.md"],
+        confidence=0.99,
+        display_hints={"explain": True},
+    )
 
 
 # --- Technique CSV line injector (for single-technique queries) ----------------
@@ -1391,6 +1386,61 @@ def _legacy_answer_with_rag(question: str, k: int | None = None) -> Tuple[str, L
     if not text.strip():
         return "🔒 Strict (context-only)\n\n❌ Model returned no text.", hits, raw or "{}"
     return f"🔒 Strict (context-only, explain)\n\n{text.strip()}", hits, raw or "{}"
+
+
+# --------------------------------------------------------------------
+# Deterministic bridge
+# --------------------------------------------------------------------
+def _answer_from_passages(
+    question: str,
+    passages: List[Dict[str, Any]],
+) -> Optional[Tuple[str, List[Dict[str, Any]], str]]:
+    fast = answer_single_technique_if_synthetic(
+        passages,
+        bullets=(output_style == "Bullets"),
+        tone=tone_style,
+        detail_mode=TECH_DETAIL_MODE,
+    )
+    if fast:
+        answer_text, raw = _compose_deterministic_result(fast)
+        return answer_text, passages, raw
+
+    if is_school_list_query(question):
+        try:
+            list_ans = try_answer_schools_list(
+                question, passages, bullets=(output_style == "Bullets")
+            )
+        except Exception:
+            list_ans = None
+        if list_ans:
+            answer_text, raw = _compose_deterministic_result(list_ans)
+            return answer_text, passages, raw
+
+    if is_school_query(question):
+        try:
+            school_fact = try_answer_school_profile(
+                question, passages, bullets=(output_style == "Bullets")
+            )
+        except Exception:
+            school_fact = None
+        if school_fact:
+            answer_text, raw = _compose_deterministic_result(school_fact)
+            return answer_text, passages, raw
+
+    try:
+        wr = try_answer_weapon_rank(question, passages)
+    except Exception:
+        wr = None
+    if wr:
+        answer_text, raw = _compose_deterministic_result(wr)
+        return answer_text, passages, raw
+
+    fact = try_extract_answer(question, passages)
+    if fact:
+        answer_text, raw = _compose_deterministic_result(fact)
+        return answer_text, passages, raw
+
+    return None
 
 
 # --------------------------------------------------------------------

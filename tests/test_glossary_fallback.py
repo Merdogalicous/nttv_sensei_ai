@@ -1,4 +1,5 @@
 import pathlib
+
 from extractors.glossary import try_answer_glossary
 
 GLOSS = pathlib.Path("data") / "Glossary - edit.txt"
@@ -6,7 +7,6 @@ TECH = pathlib.Path("data") / "Technique Descriptions.md"
 
 
 def _gloss_passages():
-    # Match the pattern used in other tests (e.g., schools, weapons)
     return [
         {
             "text": GLOSS.read_text(encoding="utf-8"),
@@ -32,51 +32,26 @@ def _gloss_and_tech_passages():
 
 
 def test_glossary_happo_geri_definition():
-    q = "What is Happo Geri?"
-    ans = try_answer_glossary(q, _gloss_passages())
-
-    assert isinstance(ans, str) and ans.strip()
-
-    low = ans.lower()
-    # Should echo the term and its meaning from the glossary
-    assert "happo geri" in low
-    assert "eight" in low  # "kicking in the eight directions" from the glossary
+    ans = try_answer_glossary("What is Happo Geri?", _gloss_passages())
+    assert ans and ans.answer_type == "glossary_term"
+    assert ans.facts["term"].lower() == "happo geri"
+    assert "eight" in ans.facts["definition"].lower()
 
 
 def test_glossary_short_term_query():
-    # Very short, term-only query should also be handled
-    q = "Happo Geri"
-    ans = try_answer_glossary(q, _gloss_passages())
-
-    assert isinstance(ans, str) and ans.strip()
-
-    low = ans.lower()
-    assert "happo geri" in low
-    assert "eight" in low
+    ans = try_answer_glossary("Happo Geri", _gloss_passages())
+    assert ans and ans.answer_type == "glossary_term"
+    assert ans.facts["term"].lower() == "happo geri"
+    assert "eight" in ans.facts["definition"].lower()
 
 
 def test_glossary_ignores_who_questions():
-    # Glossary should NOT kick in for who/when/where style questions
-    q = "Who is Hatsumi?"
-    ans = try_answer_glossary(q, _gloss_passages())
-
-    # Either None or empty/whitespace is acceptable for "no glossary answer"
-    assert not ans
+    assert not try_answer_glossary("Who is Hatsumi?", _gloss_passages())
 
 
 def test_glossary_backs_off_for_technique_like_query():
-    # With technique descriptions available, technique-like questions
-    # should not be answered by the glossary.
-    q = "Describe Oni Kudaki"
-    ans = try_answer_glossary(q, _gloss_and_tech_passages())
-
-    assert not ans
+    assert not try_answer_glossary("Describe Oni Kudaki", _gloss_and_tech_passages())
 
 
 def test_glossary_backs_off_for_short_technique_name():
-    # Even a short technique name alone should not be hijacked by the glossary
-    # when it exists in Technique Descriptions.
-    q = "Oni Kudaki"
-    ans = try_answer_glossary(q, _gloss_and_tech_passages())
-
-    assert not ans
+    assert not try_answer_glossary("Oni Kudaki", _gloss_and_tech_passages())

@@ -21,6 +21,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
+from nttv_chatbot.deterministic import DeterministicResult, build_result
 
 # ----------------------------------------------------------------------
 # Basic helpers
@@ -278,7 +279,7 @@ def _looks_like_technique_term(question: str, passages: List[Dict[str, Any]]) ->
 # Public API
 # ----------------------------------------------------------------------
 
-def try_answer_glossary(question: str, passages: List[Dict[str, Any]]) -> Optional[str]:
+def try_answer_glossary(question: str, passages: List[Dict[str, Any]]) -> Optional[DeterministicResult]:
     """Glossary-based fallback definition for single-term style questions."""
     if not _looks_like_glossary_question(question):
         return None
@@ -298,4 +299,15 @@ def try_answer_glossary(question: str, passages: List[Dict[str, Any]]) -> Option
         return None
 
     term, definition = term_def
-    return f"{term}: {definition}"
+    return build_result(
+        det_path="glossary/term",
+        answer_type="glossary_term",
+        facts={
+            "term": term,
+            "definition": definition,
+        },
+        passages=passages,
+        preferred_sources=["Glossary - edit.txt"],
+        confidence=0.9,
+        display_hints={"explain": False},
+    )

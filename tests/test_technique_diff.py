@@ -16,37 +16,20 @@ def _passages_tech_only():
 
 
 def test_diff_omote_vs_ura_gyaku_difference_between():
-    q = "What is the difference between Omote Gyaku and Ura Gyaku?"
-    ans = try_answer_technique_diff(q, _passages_tech_only())
-
-    assert isinstance(ans, str) and ans.strip()
-    low = ans.lower()
-
-    # Both techniques should be present
-    assert "omote gyaku" in low
-    assert "ura gyaku" in low
-
-    # We should see some structured fields
-    assert "translation:" in low
-    assert "type:" in low
-    assert "description:" in low
+    ans = try_answer_technique_diff("What is the difference between Omote Gyaku and Ura Gyaku?", _passages_tech_only())
+    assert ans and ans.answer_type == "technique_diff"
+    assert ans.facts["left"]["technique_name"].lower() == "omote gyaku"
+    assert ans.facts["right"]["technique_name"].lower() == "ura gyaku"
+    assert ans.facts["left"]["translation"]
+    assert ans.facts["right"]["definition"]
 
 
 def test_diff_omote_vs_ura_gyaku_vs_syntax():
-    q = "Omote Gyaku vs Ura Gyaku"
-    ans = try_answer_technique_diff(q, _passages_tech_only())
-
-    assert isinstance(ans, str) and ans.strip()
-    low = ans.lower()
-
-    assert "omote gyaku" in low
-    assert "ura gyaku" in low
-    assert "translation:" in low
+    ans = try_answer_technique_diff("Omote Gyaku vs Ura Gyaku", _passages_tech_only())
+    assert ans and ans.answer_type == "technique_diff"
+    assert ans.facts["left"]["technique_name"].lower() == "omote gyaku"
+    assert ans.facts["right"]["technique_name"].lower() == "ura gyaku"
 
 
 def test_non_diff_question_returns_none():
-    q = "Describe Omote Gyaku"
-    ans = try_answer_technique_diff(q, _passages_tech_only())
-
-    # Not a diff/comparison question → no answer from this extractor
-    assert not ans
+    assert not try_answer_technique_diff("Describe Omote Gyaku", _passages_tech_only())
