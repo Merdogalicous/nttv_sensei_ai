@@ -11,6 +11,14 @@ import streamlit as st
 from dotenv import load_dotenv
 load_dotenv()
 
+from nttv_chatbot.retrieval import (
+    LexicalRetriever,
+    RetrievalResult,
+    RetrievalSettings,
+    assemble_context as assemble_retrieval_context,
+    search as search_retrieval_pipeline,
+)
+
 
 # Vector index
 try:
@@ -431,6 +439,80 @@ def retrieval_quality(hits: List[Dict[str, Any]]) -> float:
     return max(h.get("rerank_score", h.get("score", 0.0)) for h in hits)
 
 
+# Hybrid retrieval overrides the legacy local-only retrieval helpers above.
+_LEXICAL_RETRIEVER: Optional[LexicalRetriever] = None
+_LAST_RETRIEVAL_RESULT: Optional[RetrievalResult] = None
+
+
+def get_lexical_retriever() -> LexicalRetriever:
+    global _LEXICAL_RETRIEVER
+    if _LEXICAL_RETRIEVER is None:
+        _, chunks = _load_index_and_meta()
+        _LEXICAL_RETRIEVER = LexicalRetriever(chunks)
+    return _LEXICAL_RETRIEVER
+
+
+def _legacy_retrieve(q: str, k: int | None = None) -> List[Dict[str, Any]]:
+    global _LAST_RETRIEVAL_RESULT
+
+    idx, chunks = _load_index_and_meta()
+    settings = RetrievalSettings.from_env()
+    final_top_k = k if k is not None else TOP_K
+
+    _LAST_RETRIEVAL_RESULT = search_retrieval_pipeline(
+        q,
+        index=idx,
+        chunks=chunks,
+        embed_query=embed_query,
+        final_top_k=final_top_k,
+        settings=settings,
+        lexical_retriever=get_lexical_retriever(),
+    )
+    return _LAST_RETRIEVAL_RESULT.final_candidates
+
+
+def get_last_retrieval_debug() -> Dict[str, Any]:
+    if _LAST_RETRIEVAL_RESULT is None:
+        return _empty_retrieval_debug("Retrieval was not run for this answer.")
+    return _LAST_RETRIEVAL_RESULT.to_debug_payload()
+
+
+def _legacy_build_context(snippets: List[Dict[str, Any]], max_chars: int = 6000) -> str:
+    return assemble_retrieval_context(snippets, max_chars=max_chars)
+
+
+def _legacy_retrieval_quality(hits: List[Dict[str, Any]]) -> float:
+    if not hits:
+        return 0.0
+    return max(
+        h.get("final_score")
+        or h.get("rerank_score")
+        or h.get("heuristic_score")
+        or h.get("score")
+        or 0.0
+        for h in hits
+    )
+
+
+retrieve = _legacy_retrieve
+build_context = _legacy_build_context
+retrieval_quality = _legacy_retrieval_quality
+
+
+def _empty_retrieval_debug(reason: str) -> Dict[str, Any]:
+    return {
+        "dense_candidates": [],
+        "lexical_candidates": [],
+        "fused_candidates": [],
+        "reranked_candidates": [],
+        "final_candidates": [],
+        "reranker_backend_requested": "none",
+        "reranker_backend_used": "none",
+        "reranker_fallback_reason": reason,
+        "deterministic_short_circuit": True,
+    }
+
+
 def _format_page_range(meta: Dict[str, Any]) -> str:
     page_start = meta.get("page_start") or meta.get("page")
     page_end = meta.get("page_end") or page_start
@@ -450,6 +532,49 @@ def _format_detected_tags(meta: Dict[str, Any]) -> str:
     ]
     parts = [f"{name}: {value}" for name, value in labels if value]
     return ", ".join(parts)
+
+
+def _format_score(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.3f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _render_stage_candidates(title: str, candidates: List[Dict[str, Any]]) -> None:
+    with st.expander(title, expanded=False):
+        if not candidates:
+            st.caption("No candidates for this stage.")
+            return
+
+        for i, candidate in enumerate(candidates, 1):
+            meta = candidate.get("meta") or {}
+            source_file = meta.get("source_file") or candidate.get("source") or ""
+            name = os.path.basename(source_file)
+            page_range = _format_page_range(meta)
+            heading_path = " > ".join(meta.get("heading_path") or [])
+            tags = _format_detected_tags(meta)
+            priority_bucket = meta.get("priority_bucket") or f"p{max(1, 4 - int(meta.get('priority', 1) or 1))}"
+            score_line = (
+                f"dense={_format_score(candidate.get('dense_score'))}, "
+                f"lexical={_format_score(candidate.get('lexical_score'))}, "
+                f"rrf={_format_score(candidate.get('rrf_score'))}, "
+                f"heuristic={_format_score(candidate.get('heuristic_score'))}, "
+                f"reranker={_format_score(candidate.get('reranker_score'))}, "
+                f"final={_format_score(candidate.get('final_score'))}"
+            )
+
+            st.write(f"[{i}] {name}")
+            st.caption(score_line)
+            if page_range:
+                st.caption(f"Pages: {page_range}")
+            if heading_path:
+                st.caption(f"Heading: {heading_path}")
+            st.caption(f"Priority bucket: {priority_bucket}")
+            if tags:
+                st.caption(f"Tags: {tags}")
 
 
 # --------------------------------------------------------------------
@@ -1036,7 +1161,112 @@ def is_soke_query(q: str) -> bool:
 # --------------------------------------------------------------------
 # Core RAG pipeline
 # --------------------------------------------------------------------
-def answer_with_rag(question: str, k: int | None = None) -> Tuple[str, List[Dict[str, Any]], str]:
+def _prepare_deterministic_passages(question: str) -> List[Dict[str, Any]]:
+    _, chunks = _load_index_and_meta()
+    passages = list(chunks)
+    passages = inject_rank_passage_if_needed(question, passages)
+    passages = inject_leadership_passage_if_needed(question, passages)
+    passages = inject_schools_passage_if_needed(question, passages)
+    passages = inject_weapons_passage_if_needed(question, passages)
+    passages = inject_kihon_passage_if_needed(question, passages)
+    passages = inject_techniques_passage_if_needed(question, passages)
+    passages = inject_specific_technique_line_if_needed(question, passages)
+    return passages
+
+
+def _answer_from_passages(
+    question: str,
+    passages: List[Dict[str, Any]],
+) -> Optional[Tuple[str, List[Dict[str, Any]], str]]:
+    fast = answer_single_technique_if_synthetic(
+        passages,
+        bullets=(output_style == "Bullets"),
+        tone=tone_style,
+        detail_mode=TECH_DETAIL_MODE,
+    )
+    if fast:
+        return f"🔒 Strict (context-only, explain)\n\n{fast}", passages, '{"det_path":"technique/single"}'
+
+    if is_soke_query(question):
+        ans = try_leadership(question, passages)
+        if ans:
+            return ans, passages, '{"det_path":"leadership/soke"}'
+
+    if is_school_list_query(question):
+        try:
+            list_ans = try_answer_schools_list(
+                question, passages, bullets=(output_style == "Bullets")
+            )
+        except Exception:
+            list_ans = None
+        if list_ans:
+            rendered = _render_det(list_ans, bullets=(output_style == "Bullets"), tone=tone_style)
+            return (
+                f"🔒 Strict (context-only, explain)\n\n{rendered}",
+                passages,
+                '{"det_path":"schools/list"}',
+            )
+
+    if is_school_query(question):
+        try:
+            school_fact = try_answer_school_profile(
+                question, passages, bullets=(output_style == "Bullets")
+            )
+        except Exception:
+            school_fact = None
+        if school_fact:
+            rendered = _render_det(school_fact, bullets=(output_style == "Bullets"), tone=tone_style)
+            return (
+                f"🔒 Strict (context-only, explain)\n\n{rendered}",
+                passages,
+                '{"det_path":"schools/profile"}',
+            )
+
+    asking_soke = any(t in question.lower() for t in [
+        "soke", "sÅke", "grandmaster", "headmaster", "current head", "current grandmaster"
+    ])
+    if asking_soke:
+        try:
+            fact = try_leadership(question, passages)
+        except Exception:
+            fact = None
+        if fact:
+            return f"🔒 Strict (context-only, explain)\n\n{fact}", passages, '{"det_path":"leadership/soke"}'
+
+    try:
+        wr = try_answer_weapon_rank(question, passages)
+    except Exception:
+        wr = None
+    if wr:
+        return f"🔒 Strict (context-only)\n\n{wr}", passages, '{"det_path":"weapons/rank"}'
+
+    try:
+        rr = try_answer_rank_requirements(question, passages)
+    except Exception:
+        rr = None
+    if rr:
+        rendered = _render_det(rr, bullets=(output_style == "Bullets"), tone=tone_style)
+        return f"🔒 Strict (context-only, explain)\n\n{rendered}", passages, '{"det_path":"rank/requirements"}'
+
+    q_low = (question or "").lower()
+    if "kihon happo" in q_low or "kihon happÅ" in q_low:
+        kihon_ans = try_answer_kihon_happo(question, passages)
+        if kihon_ans:
+            rendered = _render_det(kihon_ans, bullets=(output_style == "Bullets"), tone=tone_style)
+            return f"🔒 Strict (context-only, explain)\n\n{rendered}", passages, '{"det_path":"deterministic/kihon"}'
+
+    fact = try_extract_answer(question, passages)
+    if fact:
+        rendered = _render_det(fact, bullets=(output_style == "Bullets"), tone=tone_style)
+        ql = question.lower()
+        looks_like_kata = (" kata" in ql) or ("no kata" in ql) or re.search(r"\bexplain\s+.+\s+no\s+kata\b", ql)
+        det_tag = '{"det_path":"technique/core"}' if looks_like_kata else '{"det_path":"deterministic/core"}'
+        return f"🔒 Strict (context-only, explain)\n\n{rendered}", passages, det_tag
+
+    return None
+
+
+def _legacy_answer_with_rag(question: str, k: int | None = None) -> Tuple[str, List[Dict[str, Any]], str]:
     if k is None:
         k = TOP_K
 
@@ -1166,6 +1396,47 @@ def answer_with_rag(question: str, k: int | None = None) -> Tuple[str, List[Dict
 # --------------------------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------------------------
+def answer_with_rag(
+    question: str,
+    k: int | None = None,
+) -> Tuple[str, List[Dict[str, Any]], str, Dict[str, Any]]:
+    global _LAST_RETRIEVAL_RESULT
+
+    if k is None:
+        k = TOP_K
+
+    prepass_passages = _prepare_deterministic_passages(question)
+    prepass_answer = _answer_from_passages(question, prepass_passages)
+    if prepass_answer:
+        _LAST_RETRIEVAL_RESULT = None
+        answer, hits, raw = prepass_answer
+        debug_payload = _empty_retrieval_debug("Deterministic extractor answered before retrieval.")
+        return answer, hits, raw, debug_payload
+
+    hits = retrieve(question, k=k)
+    retrieval_debug = get_last_retrieval_debug()
+
+    hits = inject_rank_passage_if_needed(question, hits)
+    hits = inject_leadership_passage_if_needed(question, hits)
+    hits = inject_schools_passage_if_needed(question, hits)
+    hits = inject_weapons_passage_if_needed(question, hits)
+    hits = inject_kihon_passage_if_needed(question, hits)
+    hits = inject_techniques_passage_if_needed(question, hits)
+    hits = inject_specific_technique_line_if_needed(question, hits)
+
+    deterministic_answer = _answer_from_passages(question, hits)
+    if deterministic_answer:
+        answer, det_hits, raw = deterministic_answer
+        return answer, det_hits, raw, retrieval_debug
+
+    ctx = build_context(hits)
+    prompt = build_prompt(ctx, question)
+    text, raw = call_llm(prompt)
+    if not text.strip():
+        return "🔒 Strict (context-only)\n\nModel returned no text.", hits, raw or "{}", retrieval_debug
+    return f"🔒 Strict (context-only, explain)\n\n{text.strip()}", hits, raw or "{}", retrieval_debug
+
+
 st.set_page_config(page_title="NTTV Chatbot (RAG)", page_icon="🥋", layout="wide")
 
 st.title("🥋 NTTV Chatbot (RAG)")
@@ -1228,7 +1499,7 @@ go = st.button("Ask", type="primary")
 if go and q.strip():
     try:
         with st.spinner("Thinking..."):
-            ans, top_passages, raw_json = answer_with_rag(q.strip())
+            ans, top_passages, raw_json, retrieval_debug = answer_with_rag(q.strip())
     except Exception as e:
         st.error(f"Backend error: {e}")
         if show_debug:
@@ -1239,7 +1510,24 @@ if go and q.strip():
     st.write(ans)
 
     if show_debug:
-        st.markdown("### Retrieved sources")
+        st.markdown("### Retrieval Pipeline")
+        if retrieval_debug.get("deterministic_short_circuit"):
+            st.caption("Deterministic extractor answered before retrieval, so hybrid retrieval did not run.")
+        else:
+            st.caption(
+                f"Reranker requested: {retrieval_debug.get('reranker_backend_requested')} | "
+                f"used: {retrieval_debug.get('reranker_backend_used')}"
+            )
+            fallback_reason = retrieval_debug.get("reranker_fallback_reason")
+            if fallback_reason:
+                st.caption(f"Fallback: {fallback_reason}")
+
+            _render_stage_candidates("Dense candidates", retrieval_debug.get("dense_candidates") or [])
+            _render_stage_candidates("Lexical candidates", retrieval_debug.get("lexical_candidates") or [])
+            _render_stage_candidates("Fused candidates", retrieval_debug.get("fused_candidates") or [])
+            _render_stage_candidates("Reranked candidates", retrieval_debug.get("reranked_candidates") or [])
+
+        st.markdown("### Final Answer Sources")
         for i, h in enumerate(top_passages, 1):
             meta = h.get("meta") or {}
             source_file = meta.get("source_file") or h.get("source") or ""

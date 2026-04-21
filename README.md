@@ -16,6 +16,7 @@ The stack centers on:
 - Shared ingest pipeline for `.txt`, `.md`, `.docx`, and now structured `.pdf` parsing.
 - Optional Docling-backed PDF ingestion with page-aware and heading-aware metadata.
 - Section-aware, metadata-rich chunking with stable chunk IDs and token-based controls.
+- Hybrid retrieval with FAISS dense search, BM25 lexical search, RRF fusion, and optional reranking.
 
 ## Architecture
 
@@ -52,10 +53,13 @@ Chunking:
 
 ### Retrieval
 
-`app.py`:
+`app.py` + `nttv_chatbot/retrieval.py`:
+- preserves deterministic extractor short-circuits before retrieval for known-known questions
 - lazily loads FAISS plus `meta.pkl`
-- preserves deterministic extractor priority for known-known questions
-- reranks retrieved chunks with source-aware heuristics
+- runs dense FAISS retrieval and lexical BM25 retrieval in parallel stages
+- fuses dense + lexical candidates with Reciprocal Rank Fusion (RRF)
+- applies priority-aware heuristics as a ranking stage
+- optionally reranks the fused shortlist with Jina and falls back safely to heuristic ordering
 - uses OpenRouter-compatible LLM calls for synthesis
 
 ## Repository Structure
@@ -70,7 +74,9 @@ nttv_chatbot_ext/
 |-- index/
 |-- nttv_chatbot/
 |   |-- config.py
+|   |-- chunking.py
 |   |-- document_parsing.py
+|   |-- retrieval.py
 |   `-- llm_client.py
 |-- tests/
 |-- requirements.txt
@@ -145,6 +151,17 @@ If you deploy to Render or another host and want PDF ingestion there too, instal
 | `CHUNK_OVERLAP_TOKENS` | `40` | Overlap budget carried into the next chunk. |
 | `CHUNK_MIN_TOKENS` | `60` | Small-fragment merge threshold. |
 
+### Retrieval
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `USE_HYBRID_RETRIEVAL` | `true` | Enables dense + lexical retrieval together. |
+| `DENSE_TOP_K` | `12` | Dense FAISS candidate count before fusion. |
+| `LEXICAL_TOP_K` | `12` | Lexical BM25 candidate count before fusion. |
+| `FUSED_TOP_K` | `10` | Fused shortlist size before final context assembly. |
+| `RERANKER_BACKEND` | `none` | Supported values: `none`, `heuristic_only`, `jina_api`. |
+| `JINA_API_KEY` | `` | Optional Jina reranker API key. |
+
 ### Example `.env`
 
 ```env
@@ -165,6 +182,13 @@ CHUNK_TARGET_TOKENS=180
 CHUNK_MAX_TOKENS=240
 CHUNK_OVERLAP_TOKENS=40
 CHUNK_MIN_TOKENS=60
+
+USE_HYBRID_RETRIEVAL=true
+DENSE_TOP_K=12
+LEXICAL_TOP_K=12
+FUSED_TOP_K=10
+RERANKER_BACKEND=none
+JINA_API_KEY=
 
 TOP_K=6
 TEMPERATURE=0.0
@@ -218,6 +242,23 @@ Structured ingest adds these metadata fields when available:
 - `skipped_files`
 - `parsing`
 - `chunking`
+
+### Retrieval Strategy
+
+The retrieval stack is now stage-based and inspectable:
+- deterministic extractors get the first chance to answer before retrieval runs
+- dense retrieval uses FAISS over the existing embedding index
+- lexical retrieval uses BM25 when `rank-bm25` is installed, with a safe local token-overlap fallback
+- fusion uses Reciprocal Rank Fusion so dense-only hits and lexical-only hits can both survive
+- heuristics remain in the pipeline as a ranking stage instead of being the whole retriever
+- optional Jina reranking only touches the small fused shortlist and falls back safely if config or the API is unavailable
+
+Debug mode in `app.py` now shows:
+- dense candidates
+- lexical candidates
+- fused candidates
+- reranked candidates
+- stage scores when available
 
 ### Chunking Strategy
 
@@ -322,6 +363,12 @@ Run the chunking tests:
 
 ```bash
 pytest tests/test_chunking.py
+```
+
+Run the retrieval tests:
+
+```bash
+pytest tests/test_retrieval.py
 ```
 
 ## License
