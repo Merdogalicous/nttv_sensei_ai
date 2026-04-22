@@ -3,7 +3,7 @@ import os
 import json
 import pickle
 from dataclasses import dataclass
-from typing import List, Dict, Any, MutableMapping, Optional, Tuple
+from typing import List, Dict, Any, Optional, Protocol, Tuple
 import re
 import unicodedata
 
@@ -43,9 +43,8 @@ except Exception:
     SentenceTransformer = None
 
 # Deterministic extractors (dispatcher + specific modules)
-from extractors.kihon_happo import try_answer_kihon_happo
 from extractors import try_extract_answer
-from extractors.leadership import try_extract_answer as try_leadership
+from extractors.rank import try_answer_rank_requirements
 from extractors.weapons import try_answer_weapon_rank
 from extractors.schools import (
     try_answer_school_profile,
@@ -56,8 +55,6 @@ from extractors.schools import (
 
 from extractors.technique_match import (
     canonical_from_query as _canonical_technique_from_query,
-    is_single_technique_query as _is_single_technique_query,
-    technique_name_variants as _tech_name_variants,
 )
 
 # --------------------------------------------------------------------
@@ -70,6 +67,15 @@ EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 TOP_K = 6
 CHUNKS: List[Dict[str, Any]] = []
 INDEX = None
+
+
+class SessionStateStore(Protocol):
+    def get(self, key: str, default: Any = None) -> Any:
+        ...
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        ...
+
 
 @st.cache_resource(show_spinner=False)
 def _load_index_and_meta() -> Tuple[Any, List[Dict[str, Any]]]:
@@ -117,7 +123,8 @@ def _load_index_and_meta() -> Tuple[Any, List[Dict[str, Any]]]:
     # TOP_K is optional; default remains 6
     TOP_K_CFG = int(cfg.get("top_k", TOP_K))
 
-    if faiss is None:
+    faiss_module = faiss
+    if faiss_module is None:
         raise RuntimeError(
             "faiss is not installed.\n"
             "Make sure `faiss-cpu==1.13.0` is present in requirements.txt and installed."
@@ -148,7 +155,7 @@ def _load_index_and_meta() -> Tuple[Any, List[Dict[str, Any]]]:
         tried.append(fpath)
         if not (fpath and os.path.exists(fpath)):
             return None
-        idx_local = faiss.read_index(fpath)
+        idx_local = faiss_module.read_index(fpath)
         with open(meta_path, "rb") as f:
             chunks_local: List[Dict[str, Any]] = pickle.load(f)
         # If obviously mismatched, signal caller to try next candidate
@@ -601,7 +608,7 @@ def is_vague_followup_prompt(question: str) -> bool:
 
 
 def _get_followup_state(
-    session_state: Optional[MutableMapping[str, Any]],
+    session_state: Optional[SessionStateStore],
 ) -> Dict[str, Any]:
     if session_state is None:
         return {}
@@ -693,7 +700,7 @@ def _rewrite_vague_followup(topic: str) -> str:
 
 def resolve_followup_question(
     question: str,
-    session_state: Optional[MutableMapping[str, Any]] = None,
+    session_state: Optional[SessionStateStore] = None,
 ) -> FollowupResolution:
     original_question = (question or "").strip()
     if not is_vague_followup_prompt(original_question):
@@ -723,7 +730,7 @@ def resolve_followup_question(
 
 
 def _remember_last_answer(
-    session_state: Optional[MutableMapping[str, Any]],
+    session_state: Optional[SessionStateStore],
     *,
     original_question: str,
     effective_question: str,
@@ -1200,7 +1207,7 @@ def _fold(s: str) -> str:
     return s.lower().strip()
 
 
-def _is_single_technique_query(q: str) -> Optional[str]:
+def _extract_single_technique_candidate(q: str) -> Optional[str]:
     """
     Return a candidate technique name if the query looks like a single technique ask,
     else None. Handles 'explain/define/what is ... (no kata)?'
@@ -1215,7 +1222,7 @@ def _is_single_technique_query(q: str) -> Optional[str]:
     return cand if 2 <= len(cand) <= 80 else None
 
 
-def _tech_name_variants(name: str) -> list[str]:
+def _candidate_technique_name_variants(name: str) -> list[str]:
     v = [name.strip()]
     ln = name.strip().lower()
     if ln.endswith(" no kata"):
@@ -1260,11 +1267,11 @@ def _find_tech_line_in_chunks(name_variants: list[str]) -> Optional[str]:
 
 
 def inject_specific_technique_line_if_needed(question: str, passages: list[dict]) -> list[dict]:
-    cand = _is_single_technique_query(question)
+    cand = _extract_single_technique_candidate(question)
     if not cand:
         return passages
 
-    variants = _tech_name_variants(cand)
+    variants = _candidate_technique_name_variants(cand)
     line = _find_tech_line_in_chunks(variants)
     if not line:
         return passages
@@ -1282,146 +1289,6 @@ def inject_specific_technique_line_if_needed(question: str, passages: list[dict]
     return passages
 
 
-# --------------------------------------------------------------------
-# LLM backend (fallback)
-# --------------------------------------------------------------------
-def call_llm(
-    prompt: str,
-    system: str = "You are a precise assistant. Use only the provided context."
-) -> Tuple[str, str]:
-    import requests
-    model = os.environ.get("MODEL", "gpt-4o-mini")
-    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
-    base = (
-        os.environ.get("OPENAI_BASE_URL")
-        or os.environ.get("OPENROUTER_API_BASE")
-        or os.environ.get("LM_STUDIO_BASE_URL")
-        or "http://localhost:1234/v1"
-    )
-
-    headers = {"Content-Type": "application/json"}
-    if "openai" in base or "openrouter" in base:
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 600,
-    }
-
-    try:
-        r = requests.post(f"{base}/chat/completions", headers=headers, json=body, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-        return text, json.dumps(data)[:4000]
-    except Exception as e:
-        return "", json.dumps({"error": type(e).__name__, "detail": str(e)})[:4000]
-
-
-# --------------------------------------------------------------------
-# Prompt & deterministic rendering helpers
-# --------------------------------------------------------------------
-def build_prompt(context: str, question: str) -> str:
-    return (
-        "You must answer using ONLY the context below.\n"
-        "Be concise but complete; avoid filler.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {question}\n\n"
-        "Answer:"
-    )
-
-
-def _apply_tone(text: str, tone: str) -> str:
-    """Light-touch tone adjustments; Chatty adds a friendly closer for non-bullets."""
-    if tone == "Chatty":
-        if "\n" not in text.strip():
-            return text.strip() + " Want a quick drill or a bit of history too?"
-        return text
-    return text
-
-
-def _bullets_to_paragraph(text: str) -> str:
-    """Convert our fielded bullet output into a compact paragraph."""
-    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
-    if not lines:
-        return text
-    head = lines[0].rstrip(":")
-    fields = {}
-    for ln in lines[1:]:
-        if ln.startswith("- "):
-            ln = ln[2:]
-        if ":" in ln:
-            k, v = ln.split(":", 1)
-            fields[k.strip().lower()] = v.strip().rstrip(".")
-    segs = [head + ":"]
-    if "translation" in fields:
-        segs.append(f'“{fields["translation"]}”.')
-    if "type" in fields:
-        segs.append(f'Type: {fields["type"]}.')
-    if "focus" in fields:
-        segs.append(f'Focus: {fields["focus"]}.')
-    if "weapons" in fields:
-        segs.append(f'Weapons: {fields["weapons"]}.')
-    if "notes" in fields:
-        segs.append(f'Notes: {fields["notes"]}.')
-    return " ".join(segs).strip()
-
-
-def _render_det(text: str, *, bullets: bool, tone: str) -> str:
-    """
-    Deterministic renderer:
-    - Bullets + Chatty: prepend a synthesized 'Quick take' line from the fields.
-    - Bullets + Crisp: return bullets as-is.
-    - Paragraph modes: convert bullets to paragraph then tone-adjust.
-    """
-    if bullets:
-        if tone == "Chatty":
-            lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
-            title = lines[0].rstrip(":") if lines else ""
-            fields = {}
-            for ln in lines[1:]:
-                if ln.startswith("- "):
-                    ln = ln[2:]
-                if ":" in ln:
-                    k, v = ln.split(":", 1)
-                    fields[k.strip().lower()] = v.strip()
-            trans = fields.get("translation")
-            typ = fields.get("type")
-            focus = fields.get("focus")
-            quick_bits = []
-            if trans: quick_bits.append(trans)
-            if typ: quick_bits.append(typ)
-            quick = " — ".join(quick_bits) if quick_bits else None
-            if quick and focus:
-                summary = f"Quick take: {quick}; focus on {focus}."
-            elif quick:
-                summary = f"Quick take: {quick}."
-            elif focus:
-                summary = f"Quick take: focus on {focus}."
-            else:
-                summary = None
-
-            out = []
-            if summary:
-                out.append(summary)
-            out.append(text.strip())
-            out = "\n".join(out)
-            if not out.strip().endswith("?"):
-                out += "\n\nWant examples, drills, or lineage notes next?"
-            return out
-        else:
-            return text.strip()
-
-    para = _bullets_to_paragraph(text)
-    return _apply_tone(para, tone)
-
-
 # --- School intent detection ---
 def is_school_query(question: str) -> bool:
     ql = question.lower()
@@ -1432,12 +1299,6 @@ def is_school_query(question: str) -> bool:
     return (" ryu" in ql) or (" ryū" in ql)
 
 
-def is_soke_query(q: str) -> bool:
-    ql = q.lower()
-    return any(token in ql for token in [
-        "soke", "sōke", "current soke", "who is the soke", "who is the sōke",
-        "grandmaster", "current grandmaster", "who is the grandmaster"
-    ])
 
 
 # --------------------------------------------------------------------
@@ -1454,225 +1315,6 @@ def _prepare_deterministic_passages(question: str) -> List[Dict[str, Any]]:
     passages = inject_techniques_passage_if_needed(question, passages)
     passages = inject_specific_technique_line_if_needed(question, passages)
     return passages
-
-
-def _answer_from_passages(
-    question: str,
-    passages: List[Dict[str, Any]],
-) -> Optional[Tuple[str, List[Dict[str, Any]], str]]:
-    fast = answer_single_technique_if_synthetic(
-        passages,
-        bullets=(output_style == "Bullets"),
-        tone=tone_style,
-        detail_mode=TECH_DETAIL_MODE,
-    )
-    if fast:
-        return f"🔒 Strict (context-only, explain)\n\n{fast}", passages, '{"det_path":"technique/single"}'
-
-    if is_soke_query(question):
-        ans = try_leadership(question, passages)
-        if ans:
-            return ans, passages, '{"det_path":"leadership/soke"}'
-
-    if is_school_list_query(question):
-        try:
-            list_ans = try_answer_schools_list(
-                question, passages, bullets=(output_style == "Bullets")
-            )
-        except Exception:
-            list_ans = None
-        if list_ans:
-            rendered = _render_det(list_ans, bullets=(output_style == "Bullets"), tone=tone_style)
-            return (
-                f"🔒 Strict (context-only, explain)\n\n{rendered}",
-                passages,
-                '{"det_path":"schools/list"}',
-            )
-
-    if is_school_query(question):
-        try:
-            school_fact = try_answer_school_profile(
-                question, passages, bullets=(output_style == "Bullets")
-            )
-        except Exception:
-            school_fact = None
-        if school_fact:
-            rendered = _render_det(school_fact, bullets=(output_style == "Bullets"), tone=tone_style)
-            return (
-                f"🔒 Strict (context-only, explain)\n\n{rendered}",
-                passages,
-                '{"det_path":"schools/profile"}',
-            )
-
-    asking_soke = any(t in question.lower() for t in [
-        "soke", "sÅke", "grandmaster", "headmaster", "current head", "current grandmaster"
-    ])
-    if asking_soke:
-        try:
-            fact = try_leadership(question, passages)
-        except Exception:
-            fact = None
-        if fact:
-            return f"🔒 Strict (context-only, explain)\n\n{fact}", passages, '{"det_path":"leadership/soke"}'
-
-    try:
-        wr = try_answer_weapon_rank(question, passages)
-    except Exception:
-        wr = None
-    if wr:
-        return f"🔒 Strict (context-only)\n\n{wr}", passages, '{"det_path":"weapons/rank"}'
-
-    try:
-        rr = try_answer_rank_requirements(question, passages)
-    except Exception:
-        rr = None
-    if rr:
-        rendered = _render_det(rr, bullets=(output_style == "Bullets"), tone=tone_style)
-        return f"🔒 Strict (context-only, explain)\n\n{rendered}", passages, '{"det_path":"rank/requirements"}'
-
-    q_low = (question or "").lower()
-    if "kihon happo" in q_low or "kihon happÅ" in q_low:
-        kihon_ans = try_answer_kihon_happo(question, passages)
-        if kihon_ans:
-            rendered = _render_det(kihon_ans, bullets=(output_style == "Bullets"), tone=tone_style)
-            return f"🔒 Strict (context-only, explain)\n\n{rendered}", passages, '{"det_path":"deterministic/kihon"}'
-
-    fact = try_extract_answer(question, passages)
-    if fact:
-        rendered = _render_det(fact, bullets=(output_style == "Bullets"), tone=tone_style)
-        ql = question.lower()
-        looks_like_kata = (" kata" in ql) or ("no kata" in ql) or re.search(r"\bexplain\s+.+\s+no\s+kata\b", ql)
-        det_tag = '{"det_path":"technique/core"}' if looks_like_kata else '{"det_path":"deterministic/core"}'
-        return f"🔒 Strict (context-only, explain)\n\n{rendered}", passages, det_tag
-
-    return None
-
-
-def _legacy_answer_with_rag(question: str, k: int | None = None) -> Tuple[str, List[Dict[str, Any]], str]:
-    if k is None:
-        k = TOP_K
-
-    # 1) Retrieve
-    hits = retrieve(question, k=k)
-
-    # 2) Inject domain-critical sources
-    hits = inject_rank_passage_if_needed(question, hits)
-    hits = inject_leadership_passage_if_needed(question, hits)
-    hits = inject_schools_passage_if_needed(question, hits)
-    hits = inject_weapons_passage_if_needed(question, hits)
-    hits = inject_kihon_passage_if_needed(question, hits)
-    hits = inject_techniques_passage_if_needed(question, hits)
-    hits = inject_specific_technique_line_if_needed(question, hits)
-
-    # Fast-path: if we injected a single technique CSV line, answer immediately
-    fast = answer_single_technique_if_synthetic(
-        hits,
-        bullets=(output_style == "Bullets"),
-        tone=tone_style,
-        detail_mode=TECH_DETAIL_MODE,
-    )
-    if fast:
-        return f"🔒 Strict (context-only, explain)\n\n{fast}", hits, '{"det_path":"technique/single"}'
-
-    # Leadership (Sōke) gets priority over school profile if asked directly
-    if is_soke_query(question):
-        ans = try_leadership(question, hits)
-        if ans:
-            return ans, hits, '{"det_path":"leadership/soke"}'
-
-    # Schools LIST short-circuit
-    if is_school_list_query(question):
-        try:
-            list_ans = try_answer_schools_list(
-                question, hits, bullets=(output_style == "Bullets")
-            )
-        except Exception:
-            list_ans = None
-        if list_ans:
-            rendered = _render_det(list_ans, bullets=(output_style == "Bullets"), tone=tone_style)
-            return (
-                f"🔒 Strict (context-only, explain)\n\n{rendered}",
-                hits,
-                '{"det_path":"schools/list"}'
-            )
-
-    # School PROFILE short-circuit
-    if is_school_query(question):
-        try:
-            school_fact = try_answer_school_profile(
-                question, hits, bullets=(output_style == "Bullets")
-            )
-        except Exception:
-            school_fact = None
-        if school_fact:
-            rendered = _render_det(school_fact, bullets=(output_style == "Bullets"), tone=tone_style)
-            return (
-                f"🔒 Strict (context-only, explain)\n\n{rendered}",
-                hits,
-                '{"det_path":"schools/profile"}'
-            )
-
-        # fallback LLM for schools
-        ctx = build_context(hits)
-        prompt = build_prompt(ctx, question)
-        text, raw = call_llm(prompt)
-        if not text.strip():
-            return _EMPTY_GROUNDED_ANSWER, hits, raw or "{}"
-        return f"🔒 Strict (context-only, explain)\n\n{text.strip()}", hits, raw or "{}"
-
-    # Leadership short-circuit (generic)
-    asking_soke = any(t in question.lower() for t in [
-        "soke","sōke","grandmaster","headmaster","current head","current grandmaster"
-    ])
-    if asking_soke:
-        try:
-            fact = try_leadership(question, hits)
-        except Exception:
-            fact = None
-        if fact:
-            return f"🔒 Strict (context-only, explain)\n\n{fact}", hits, '{"det_path":"leadership/soke"}'
-
-    # Weapon rank short-circuit
-    try:
-        wr = try_answer_weapon_rank(question, hits)
-    except Exception:
-        wr = None
-    if wr:
-        return f"🔒 Strict (context-only)\n\n{wr}", hits, '{"det_path":"weapons/rank"}'
-
-    # Rank requirements short-circuit
-    try:
-        rr = try_answer_rank_requirements(question, hits)
-    except Exception:
-        rr = None
-    if rr:
-        rendered = _render_det(rr, bullets=(output_style == "Bullets"), tone=tone_style)
-        return f"🔒 Strict (context-only, explain)\n\n{rendered}", hits, '{"det_path":"rank/requirements"}'
-
-    # Kihon Happo hard short-circuit
-    q_low = (question or "").lower()
-    if "kihon happo" in q_low or "kihon happō" in q_low:
-        kihon_ans = try_answer_kihon_happo(question, hits)
-        if kihon_ans:
-            rendered = _render_det(kihon_ans, bullets=(output_style == "Bullets"), tone=tone_style)
-            return f"🔒 Strict (context-only, explain)\n\n{rendered}", hits, '{"det_path":"deterministic/kihon"}'
-
-    # Generic deterministic dispatcher
-    fact = try_extract_answer(question, hits)
-    if fact:
-        rendered = _render_det(fact, bullets=(output_style == "Bullets"), tone=tone_style)
-        ql = question.lower()
-        looks_like_kata = (" kata" in ql) or ("no kata" in ql) or re.search(r"\bexplain\s+.+\s+no\s+kata\b", ql)
-        det_tag = '{"det_path":"technique/core"}' if looks_like_kata else '{"det_path":"deterministic/core"}'
-        return f"🔒 Strict (context-only, explain)\n\n{rendered}", hits, det_tag
-
-    # LLM fallback with retrieved context
-    ctx = build_context(hits)
-    prompt = build_prompt(ctx, question)
-    text, raw = call_llm(prompt)
-    if not text.strip():
-        return _EMPTY_GROUNDED_ANSWER, hits, raw or "{}"
-    return f"🔒 Strict (context-only, explain)\n\n{text.strip()}", hits, raw or "{}"
 
 
 # --------------------------------------------------------------------
@@ -1722,6 +1364,18 @@ def _answer_from_passages(
         answer_text, raw, route_debug = _compose_deterministic_result(question, wr, passages)
         return answer_text, passages, raw, route_debug, wr
 
+    try:
+        rank_requirements = try_answer_rank_requirements(question, passages)
+    except Exception:
+        rank_requirements = None
+    if rank_requirements:
+        answer_text, raw, route_debug = _compose_deterministic_result(
+            question,
+            rank_requirements,
+            passages,
+        )
+        return answer_text, passages, raw, route_debug, rank_requirements
+
     fact = try_extract_answer(question, passages)
     if fact:
         answer_text, raw, route_debug = _compose_deterministic_result(question, fact, passages)
@@ -1754,7 +1408,7 @@ def answer_with_rag(
     question: str,
     k: int | None = None,
     *,
-    session_state: Optional[MutableMapping[str, Any]] = None,
+    session_state: Optional[SessionStateStore] = None,
 ) -> Tuple[str, List[Dict[str, Any]], str, Dict[str, Any]]:
     global _LAST_RETRIEVAL_RESULT
 
