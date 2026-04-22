@@ -3,7 +3,7 @@ import os
 import json
 import pickle
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Protocol, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 import re
 import unicodedata
 
@@ -67,14 +67,6 @@ EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 TOP_K = 6
 CHUNKS: List[Dict[str, Any]] = []
 INDEX = None
-
-
-class SessionStateStore(Protocol):
-    def get(self, key: str, default: Any = None) -> Any:
-        ...
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        ...
 
 
 @st.cache_resource(show_spinner=False)
@@ -608,7 +600,7 @@ def is_vague_followup_prompt(question: str) -> bool:
 
 
 def _get_followup_state(
-    session_state: Optional[SessionStateStore],
+    session_state: Any | None,
 ) -> Dict[str, Any]:
     if session_state is None:
         return {}
@@ -700,7 +692,7 @@ def _rewrite_vague_followup(topic: str) -> str:
 
 def resolve_followup_question(
     question: str,
-    session_state: Optional[SessionStateStore] = None,
+    session_state: Any | None = None,
 ) -> FollowupResolution:
     original_question = (question or "").strip()
     if not is_vague_followup_prompt(original_question):
@@ -730,7 +722,7 @@ def resolve_followup_question(
 
 
 def _remember_last_answer(
-    session_state: Optional[SessionStateStore],
+    session_state: Any | None,
     *,
     original_question: str,
     effective_question: str,
@@ -1408,7 +1400,7 @@ def answer_with_rag(
     question: str,
     k: int | None = None,
     *,
-    session_state: Optional[SessionStateStore] = None,
+    session_state: Any | None = None,
 ) -> Tuple[str, List[Dict[str, Any]], str, Dict[str, Any]]:
     global _LAST_RETRIEVAL_RESULT
 
