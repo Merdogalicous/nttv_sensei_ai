@@ -9,6 +9,7 @@
 {"id":"det_weapon_kusari_rank","question":"At what rank do I learn kusari fundo?","category":"deterministic","expected_keywords":["4th kyu"],"expected_det_path":"weapons/rank","expected_sources":["NTTV Weapons Reference.txt"]}
 {"id":"det_kyusho_ura_kimon","question":"Where is the Ura Kimon kyusho point?","category":"deterministic","expected_keywords":["ura kimon","below the nipple"],"expected_det_path":"kyusho/point","expected_sources":["KYUSHO.txt"]}
 {"id":"det_leadership_gyokko_soke","question":"Who is the soke of Gyokko Ryu?","category":"deterministic","expected_keywords":["ishizuka tetsuji"],"expected_det_path":"leadership/soke","expected_sources":["Bujinkan Leadership and Wisdom.txt"]}
+{"id":"det_oni_kudaki_profile","question":"Describe Oni Kudaki","category":"deterministic","expected_keywords":["oni kudaki","demon crusher","elbow"],"expected_det_path":"technique/single","expected_sources":["Technique Descriptions.md"]}
 {"id":"ret_buyu_meaning","question":"What is Buyu?","category":"retrieval","expected_keywords":["martial arts friend"],"expected_sources":["What is Buyu.txt"]}
 {"id":"ret_buyu_purpose","question":"How does the material describe the purpose of martial arts?","category":"retrieval","expected_keywords":["stop violence","compassionate heart"],"expected_sources":["What is Buyu.txt"]}
 {"id":"ret_budo_taijutsu_meaning","question":"What does Budo Taijutsu mean in the Buyu material?","category":"retrieval","expected_keywords":["body","skill","martial way"],"expected_sources":["What is Buyu.txt"]}

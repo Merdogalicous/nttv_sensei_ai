@@ -63,6 +63,21 @@ def test_router_prefers_technique_over_glossary():
     assert ans.facts["definition"]
 
 
+def test_router_technique_fallback_uses_on_disk_file_for_partial_passages():
+    koshi_row = next(
+        line for line in TECH.read_text(encoding="utf-8").splitlines() if line.startswith("Koshi Kudaki,")
+    )
+    passages = [
+        {"text": koshi_row, "source": "Technique Descriptions.md", "meta": {"priority": 1}},
+        {"text": GLOSS.read_text(encoding="utf-8"), "source": "Glossary - edit.txt", "meta": {"priority": 1}},
+    ]
+
+    ans = try_extract_answer("Describe Oni Kudaki", passages)
+
+    assert ans and ans.answer_type == "technique"
+    assert ans.facts["technique_name"].lower() == "oni kudaki"
+
+
 def test_router_glossary_fallback_when_no_specific_extractor():
     passages = [
         {"text": GLOSS.read_text(encoding="utf-8"), "source": "Glossary - edit.txt", "meta": {"priority": 1}}

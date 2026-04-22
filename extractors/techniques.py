@@ -3,16 +3,17 @@ from __future__ import annotations
 import os
 import re
 import unicodedata
-from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from nttv_chatbot.deterministic import DeterministicResult, build_result
 
+from .technique_match import canonical_from_query
+
 try:
-    from .technique_loader import build_indexes, parse_technique_md
+    from .technique_loader import parse_technique_md
 except Exception:  # pragma: no cover - optional compatibility path
     parse_technique_md = None
-    build_indexes = None
 
 
 CONCEPT_BANS = ("kihon happo", "kihon happo", "sanshin", "school", "schools", "ryu", "ryu")
@@ -70,14 +71,61 @@ def _looks_like_technique_q(question: str) -> bool:
     return len(ql.split()) <= 7 and any(hint in ql for hint in NAME_HINTS)
 
 
+def _has_direct_technique_trigger(question: str) -> bool:
+    ql = _norm_space(question).lower()
+    return any(trigger in ql for trigger in TRIGGERS)
+
+
+def _load_full_technique_text() -> str:
+    here = Path(__file__).resolve()
+    candidates = [
+        here.parent.parent / "data" / "Technique Descriptions.md",
+        here.parent / "Technique Descriptions.md",
+    ]
+    for path in candidates:
+        try:
+            if path.exists():
+                return path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+    return ""
+
+
 def _gather_full_technique_text(passages: List[Dict[str, Any]]) -> str:
     parts: list[str] = []
     for passage in passages:
         src_raw = passage.get("source") or ""
         src = src_raw.lower()
         if _same_source_name(src_raw, "Technique Descriptions.md") or "technique descriptions" in src:
-            parts.append(passage.get("text", ""))
-    return "\n".join(parts)
+            text = passage.get("text", "")
+            if text:
+                parts.append(text)
+
+    passage_text = "\n".join(parts).strip()
+    if not parts:
+        return ""
+
+    full_text = _load_full_technique_text().strip()
+    if full_text and _looks_incomplete_technique_text(passage_text, full_text):
+        return full_text
+    return passage_text or full_text
+
+
+def _looks_incomplete_technique_text(passage_text: str, full_text: str) -> bool:
+    if not passage_text.strip():
+        return True
+    if not full_text.strip():
+        return False
+    if passage_text.strip() == full_text.strip():
+        return False
+
+    passage_rows = _count_technique_rows(passage_text)
+    full_rows = _count_technique_rows(full_text)
+    if full_rows <= 0:
+        return False
+    if passage_rows <= 0:
+        return True
+    return passage_rows < full_rows
 
 
 def _extract_candidate(question_text: str) -> str:
@@ -148,9 +196,9 @@ def _has_header(cells: List[str]) -> bool:
 
 def _to_bool(value: str) -> Optional[bool]:
     lowered = (value or "").strip().lower()
-    if lowered in {"1", "true", "yes", "y", "✅", "✓", "✔"}:
+    if lowered in {"1", "true", "yes", "y", "âœ…", "âœ“", "âœ”"}:
         return True
-    if lowered in {"0", "false", "no", "n", "❌", "✗", "✕"}:
+    if lowered in {"0", "false", "no", "n", "âŒ", "âœ—", "âœ•"}:
         return False
     return None
 
@@ -172,6 +220,37 @@ def _row_to_record_positional(row: List[str]) -> Dict[str, Any]:
     }
 
 
+def _count_technique_rows(md_text: str) -> int:
+    if not md_text.strip():
+        return 0
+
+    records = _parse_records(md_text)
+    if records:
+        return len(records)
+
+    rows = _scan_csv_rows_limited(md_text)
+    if not rows:
+        return 0
+    return len(rows[1:] if _has_header(rows[0]) else rows)
+
+
+def _parse_records(md_text: str) -> List[Dict[str, Any]]:
+    if not md_text.strip():
+        return []
+
+    if parse_technique_md is not None:
+        try:
+            return parse_technique_md(md_text)
+        except Exception:
+            pass
+
+    rows = _scan_csv_rows_limited(md_text)
+    if not rows:
+        return []
+    data_rows = rows[1:] if _has_header(rows[0]) else rows
+    return [_row_to_record_positional(row) for row in data_rows if row and row[0].strip()]
+
+
 def _direct_line_lookup(md_text: str, cand_variants: List[str]) -> Optional[Dict[str, Any]]:
     anchors = {_fold(value) for value in cand_variants if value and not value.startswith("#")}
     if not anchors:
@@ -187,15 +266,14 @@ def _direct_line_lookup(md_text: str, cand_variants: List[str]) -> Optional[Dict
     return None
 
 
-def _csv_fallback_lookup(md_text: str, cand_variants: List[str]) -> Optional[Dict[str, Any]]:
+def _csv_exact_lookup(md_text: str, cand_variants: List[str]) -> Optional[Dict[str, Any]]:
     rows = _scan_csv_rows_limited(md_text)
     if not rows:
         return None
 
-    has_header = _has_header(rows[0])
-    data_rows = rows[1:] if has_header else rows
-    cand_folded = [_fold(item) for item in cand_variants]
-    cand_lite = [_lite(item) for item in cand_variants]
+    data_rows = rows[1:] if _has_header(rows[0]) else rows
+    cand_folded = {_fold(item) for item in cand_variants}
+    cand_lite = {_lite(item) for item in cand_variants}
 
     for row in data_rows:
         if not row or not row[0].strip():
@@ -203,21 +281,45 @@ def _csv_fallback_lookup(md_text: str, cand_variants: List[str]) -> Optional[Dic
         name = row[0].strip()
         if _fold(name) in cand_folded or _lite(name) in cand_lite:
             return _row_to_record_positional(row)
-
-    best_row: Optional[List[str]] = None
-    best_score = 0.0
-    target = _fold(cand_variants[0]) if cand_variants else ""
-    for row in data_rows:
-        name = (row[0] or "").strip()
-        if not name:
-            continue
-        score = SequenceMatcher(None, _fold(name), target).ratio()
-        if score > best_score:
-            best_row = row
-            best_score = score
-    if best_row is not None and best_score >= 0.85:
-        return _row_to_record_positional(best_row)
     return None
+
+
+def _record_field_matches(rec: Dict[str, Any], field_name: str, cand_variants: List[str]) -> bool:
+    value = rec.get(field_name) or ""
+    if not str(value).strip():
+        return False
+
+    candidate_folded = {_fold(item) for item in cand_variants if item}
+    candidate_lite = {_lite(item) for item in cand_variants if item}
+    field_variants = _candidate_variants(str(value))
+    return any(_fold(item) in candidate_folded or _lite(item) in candidate_lite for item in field_variants)
+
+
+def _lookup_record_from_records(
+    records: List[Dict[str, Any]],
+    cand_variants: List[str],
+) -> Optional[Dict[str, Any]]:
+    if not records:
+        return None
+
+    for rec in records:
+        if _record_field_matches(rec, "name", cand_variants):
+            return rec
+
+    for field_name in ("translation", "japanese"):
+        for rec in records:
+            if _record_field_matches(rec, field_name, cand_variants):
+                return rec
+
+    return None
+
+
+def _normalize_tags(tags_raw: Any) -> List[str]:
+    if isinstance(tags_raw, list):
+        return [str(item).strip() for item in tags_raw if str(item).strip()]
+    if isinstance(tags_raw, str):
+        return [item.strip() for item in re.split(r"[|,]", tags_raw) if item.strip()]
+    return []
 
 
 def _record_to_result(
@@ -226,8 +328,6 @@ def _record_to_result(
     *,
     det_path: str,
 ) -> DeterministicResult:
-    tags_raw = rec.get("tags") or ""
-    tags = [item.strip() for item in str(tags_raw).split(",") if item.strip()]
     return build_result(
         det_path=det_path,
         answer_type="technique",
@@ -241,7 +341,7 @@ def _record_to_result(
             "safety": rec.get("safety"),
             "partner_required": rec.get("partner_required"),
             "solo": rec.get("solo"),
-            "tags": tags,
+            "tags": _normalize_tags(rec.get("tags")),
             "definition": rec.get("description"),
         },
         passages=passages,
@@ -252,6 +352,22 @@ def _record_to_result(
     )
 
 
+def _exact_record_lookup(
+    md_text: str,
+    records: List[Dict[str, Any]],
+    cand_variants: List[str],
+) -> Optional[Dict[str, Any]]:
+    rec = _direct_line_lookup(md_text, cand_variants)
+    if rec:
+        return rec
+
+    rec = _csv_exact_lookup(md_text, cand_variants)
+    if rec:
+        return rec
+
+    return _lookup_record_from_records(records, cand_variants)
+
+
 def try_answer_technique(question: str, passages: List[Dict[str, Any]]) -> Optional[DeterministicResult]:
     if not _looks_like_technique_q(question):
         return None
@@ -260,50 +376,21 @@ def try_answer_technique(question: str, passages: List[Dict[str, Any]]) -> Optio
     if not md_text.strip():
         return None
 
-    ql = _norm_space(question).lower()
-    cand_raw = _extract_candidate(ql)
-    variants = _candidate_variants(cand_raw)
+    records = _parse_records(md_text)
+    cand_raw = _extract_candidate(question)
+    if not cand_raw:
+        return None
 
-    rec = _direct_line_lookup(md_text, variants)
-    if rec:
-        return _record_to_result(rec, passages, det_path="technique/single")
+    canonical_name = canonical_from_query(question) if _has_direct_technique_trigger(question) else None
+    if canonical_name:
+        rec = _exact_record_lookup(md_text, records, _candidate_variants(canonical_name))
+        if rec:
+            return _record_to_result(rec, passages, det_path="technique/single")
+        return None
 
-    rec = _csv_fallback_lookup(md_text, variants)
+    rec = _exact_record_lookup(md_text, records, _candidate_variants(cand_raw))
     if rec:
         return _record_to_result(rec, passages, det_path="technique/core")
 
-    if parse_technique_md and build_indexes:
-        try:
-            records = parse_technique_md(md_text)
-            idx = build_indexes(records) if records else None
-        except Exception:
-            idx = None
-        if idx:
-            by_name = idx["by_name"]
-            by_lower = idx["by_lower"]
-            by_fold = idx["by_fold"]
-            by_key = idx["by_keylite"]
-
-            for variant in variants:
-                key = variant.lower()
-                if key in by_lower:
-                    return _record_to_result(by_name[by_lower[key]], passages, det_path="technique/core")
-                folded_key = _fold(variant)
-                if folded_key in by_fold:
-                    return _record_to_result(by_name[by_fold[folded_key]], passages, det_path="technique/core")
-                lite_key = _lite(variant)
-                if lite_key in by_key:
-                    return _record_to_result(by_name[by_key[lite_key]], passages, det_path="technique/core")
-
-            cq = _fold(cand_raw)
-            best_name: Optional[str] = None
-            best_score = 0.0
-            for name in by_name.keys():
-                score = SequenceMatcher(None, _fold(name), cq).ratio()
-                if score > best_score:
-                    best_name = name
-                    best_score = score
-            if best_name and best_score >= 0.80:
-                return _record_to_result(by_name[best_name], passages, det_path="technique/core")
-
+    # Direct single-technique questions should fail safely rather than guess a nearby row.
     return None
