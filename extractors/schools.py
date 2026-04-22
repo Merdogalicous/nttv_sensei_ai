@@ -1,7 +1,9 @@
 from __future__ import annotations
+
 from typing import List, Dict, Any, Optional, Tuple
 import re
 import os
+import unicodedata
 
 from nttv_chatbot.deterministic import DeterministicResult, build_result
 
@@ -10,55 +12,58 @@ from nttv_chatbot.deterministic import DeterministicResult, build_result
 # ----------------------------
 SCHOOL_ALIASES: Dict[str, List[str]] = {
     "Togakure Ryu": [
-        "togakure ryu", "togakure-ryu", "togakure ryū", "togakure-ryū",
+        "togakure ryu", "togakure-ryu",
         "togakure ryu ninpo", "togakure ryu ninpo taijutsu", "togakure"
     ],
     "Gyokko Ryu": [
-        "gyokko ryu", "gyokko-ryu", "gyokko ryū", "gyokko-ryū", "gyokko"
+        "gyokko ryu", "gyokko-ryu", "gyokko"
     ],
     "Koto Ryu": [
-        "koto ryu", "koto-ryu", "koto ryū", "koto-ryū", "koto"
+        "koto ryu", "koto-ryu", "koto"
     ],
     "Shinden Fudo Ryu": [
-        "shinden fudo ryu", "shinden fudo-ryu", "shinden fudō ryū", "shinden fudō-ryū",
+        "shinden fudo ryu", "shinden fudo-ryu",
         "shinden fudo", "shinden fudo ryu dakentaijutsu", "shinden fudo ryu jutaijutsu"
     ],
     "Kukishinden Ryu": [
-        "kukishinden ryu", "kukishinden-ryu", "kukishinden ryū", "kukishinden-ryū", "kukishinden"
+        "kukishinden ryu", "kukishinden-ryu", "kukishinden"
     ],
     "Takagi Yoshin Ryu": [
-        "takagi yoshin ryu", "takagi yoshin-ryu", "takagi yōshin ryū", "takagi yōshin-ryū",
+        "takagi yoshin ryu", "takagi yoshin-ryu",
         "takagi yoshin", "hoko ryu takagi yoshin ryu", "takagi"
     ],
     "Gikan Ryu": [
-        "gikan ryu", "gikan-ryu", "gikan ryū", "gikan-ryū", "gikan"
+        "gikan ryu", "gikan-ryu", "gikan"
     ],
     "Gyokushin Ryu": [
-        "gyokushin ryu", "gyokushin-ryu", "gyokushin ryū", "gyokushin-ryū", "gyokushin"
+        "gyokushin ryu", "gyokushin-ryu", "gyokushin"
     ],
     "Kumogakure Ryu": [
-        "kumogakure ryu", "kumogakure-ryu", "kumogakure ryū", "kumogakure-ryū", "kumogakure"
+        "kumogakure ryu", "kumogakure-ryu", "kumogakure"
     ],
 }
 
-# ----------------------------
-# Normalization helpers
-# ----------------------------
-_MACRON_MAP = str.maketrans({
-    "ō": "o", "Ō": "O",
-    "ū": "u", "Ū": "U",
-    "ā": "a", "Ā": "A",
-    "ī": "i", "Ī": "I",
-    "ē": "e", "Ē": "E",
-    "’": "'", "“": '"', "”": '"',
-})
+SCHOOL_PROFILE_SAFETY: Dict[str, Dict[str, str]] = {
+    "Togakure Ryu": {"translation": "Hidden Door School", "type": "Ninjutsu"},
+    "Gyokko Ryu": {"translation": "Jewel Tiger School", "type": "Samurai"},
+    "Koto Ryu": {"translation": "Tiger Knocking Down School", "type": "Samurai"},
+    "Shinden Fudo Ryu": {"translation": "Immovable Heart School", "type": "Samurai"},
+    "Kukishinden Ryu": {"translation": "Nine Demon Gods School", "type": "Samurai"},
+    "Takagi Yoshin Ryu": {"translation": "High Tree, Raised Heart School", "type": "Samurai"},
+    "Gikan Ryu": {"translation": "Truth, Loyalty, & Justice School", "type": "Samurai"},
+    "Gyokushin Ryu": {"translation": "Jeweled Heart School", "type": "Ninjutsu"},
+    "Kumogakure Ryu": {"translation": "Hidden Clouds School", "type": "Ninjutsu"},
+}
 
 def _norm(s: str) -> str:
-    s = (s or "").translate(_MACRON_MAP)
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
     s = s.replace("\u2010", "-").replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "-")
-    s = s.replace("–", "-").replace("—", "-")
+    s = s.replace("â€“", "-").replace("â€”", "-")
     s = re.sub(r"\s+", " ", s)
     return s.strip().lower()
+
 
 def _same_source_name(p_source: str, target_name: str) -> bool:
     """
@@ -71,21 +76,48 @@ def _same_source_name(p_source: str, target_name: str) -> bool:
     base_target = os.path.basename(target_name).lower()
     return base_actual == base_target
 
+
+def _school_tokens(canon: str) -> List[str]:
+    return [_norm(canon)] + [_norm(alias) for alias in SCHOOL_ALIASES.get(canon, [])]
+
+
+def _canon_from_school_label(label: str) -> Optional[str]:
+    candidate = _norm(label).strip(" :-")
+    if not candidate:
+        return None
+    for canon in SCHOOL_ALIASES:
+        if candidate in _school_tokens(canon):
+            return canon
+    return None
+
+
+def _school_header_canon(line: str) -> Optional[str]:
+    raw = (line or "").strip()
+    if not raw or raw.startswith(("-", "*")):
+        return None
+
+    labels = [raw]
+    header_match = re.match(r"^\s*school\s*[:\-–—]\s*(.+?)\s*$", raw, flags=re.IGNORECASE)
+    if header_match:
+        labels.append(header_match.group(1))
+    if raw.endswith(":"):
+        labels.append(raw[:-1])
+
+    for label in labels:
+        canon = _canon_from_school_label(label)
+        if canon:
+            return canon
+    return None
+
+
 def _looks_like_school_header(line: str) -> bool:
-    t = _norm(line)
-    return (
-        t.startswith("school:") or
-        t.startswith("school -") or
-        t.startswith("school –") or
-        t.endswith(" ryu:") or
-        t.endswith(" ryu :")
-    )
+    return _school_header_canon(line) is not None
+
 
 def _canon_for_query(question: str) -> Optional[str]:
     qn = _norm(question)
-    for canon, aliases in SCHOOL_ALIASES.items():
-        tokens = [_norm(canon)] + [_norm(a) for a in aliases]
-        if any(tok in qn for tok in tokens):
+    for canon in SCHOOL_ALIASES:
+        if any(tok in qn for tok in _school_tokens(canon)):
             return canon
     m = re.search(r"([a-z0-9\- ]+)\s+ryu\b", qn)
     if m:
@@ -94,6 +126,7 @@ def _canon_for_query(question: str) -> Optional[str]:
             if _norm(canon).startswith(guess):
                 return canon
     return None
+
 
 # ----------------------------
 # List-intent detection (EXPORTED)
@@ -111,29 +144,36 @@ def is_school_list_query(question: str) -> bool:
     ]
     return any(t in q for t in triggers)
 
+
 # ----------------------------
 # Slicing & field extraction
 # ----------------------------
 _FIELD_KEYS = ["translation", "type", "focus", "weapons", "notes"]
 
+
+def _extract_school_block(lines: List[str], start: int) -> List[str]:
+    end = len(lines)
+    for idx in range(start + 1, len(lines)):
+        if lines[idx].strip() == "---" or _looks_like_school_header(lines[idx]):
+            end = idx
+            break
+    return lines[start:end]
+
+
 def _slice_school_blocks(blob: str) -> List[Tuple[str, List[str]]]:
     lines = blob.splitlines()
     idxs = [i for i, ln in enumerate(lines) if _looks_like_school_header(ln)]
     blocks: List[Tuple[str, List[str]]] = []
-    for j, i in enumerate(idxs):
-        start = i
-        end = idxs[j + 1] if j + 1 < len(idxs) else len(lines)
-        for k in range(i + 1, end):
-            if lines[k].strip() == "---":
-                end = k
-                break
-        blocks.append((lines[start], lines[start + 1:end]))
+    for idx in idxs:
+        block = _extract_school_block(lines, idx)
+        if block:
+            blocks.append((block[0], block[1:]))
     return blocks
 
+
 def _header_matches(header_line: str, canon: str) -> bool:
-    h = _norm(header_line)
-    cn = _norm(canon)
-    return cn in h
+    return _school_header_canon(header_line) == canon
+
 
 def _parse_fields(block_lines: List[str]) -> Dict[str, str]:
     data: Dict[str, str] = {}
@@ -146,24 +186,24 @@ def _parse_fields(block_lines: List[str]) -> Dict[str, str]:
             val = m.group(2).strip()
             data[key] = (data.get(key, "") + (" " if key in data and data[key] else "") + val).strip()
         else:
-            # continuation line (append to last seen key)
             if data:
                 last_key = list(data.keys())[-1]
                 data[last_key] = (data[last_key] + " " + ln.strip()).strip()
     return {k: v.strip() for k, v in data.items() if k in _FIELD_KEYS and v.strip()}
 
+
 def _format_profile(canon: str, fields: Dict[str, str], bullets: bool) -> str:
     title = canon
     if bullets:
         parts = [f"{title}:"]
-        for k in ["translation", "type", "focus", "weapons", "notes"]:
-            if k in fields:
-                parts.append(f"- {k.capitalize()}: {fields[k]}")
+        for key in ["translation", "type", "focus", "weapons", "notes"]:
+            if key in fields:
+                parts.append(f"- {key.capitalize()}: {fields[key]}")
         return "\n".join(parts)
 
     segs = []
     if "translation" in fields:
-        segs.append(f'“{fields["translation"]}”.')
+        segs.append(f'"{fields["translation"]}".')
     if "type" in fields:
         segs.append(f'Type: {fields["type"]}.')
     if "focus" in fields:
@@ -174,52 +214,41 @@ def _format_profile(canon: str, fields: Dict[str, str], bullets: bool) -> str:
         segs.append(f'Notes: {fields["notes"]}.')
     return f"{title}: " + (" ".join(segs) if segs else "")
 
+
 def _collect_schools_blob(passages: List[Dict[str, Any]]) -> str:
-    candidates: List[Tuple[int, int, str]] = []  # (syn_flag, -len, text)
-    for p in passages:
-        src_raw = p.get("source") or ""
+    candidates: List[Tuple[int, int, str]] = []
+    for passage in passages:
+        src_raw = passage.get("source") or ""
         src = src_raw.lower()
-        txt = (p.get("text") or "").strip()
+        txt = (passage.get("text") or "").strip()
         if not txt:
             continue
         if _same_source_name(src_raw, "Schools of the Bujinkan Summaries.txt") or "schools of the bujinkan summaries" in src:
             syn = 0 if "(synthetic)" in src else 1
             candidates.append((syn, -len(txt), txt))
-        else:
-            # any doc that contains School: style headers
-            if "school:" in _norm(txt):
-                candidates.append((1, -len(txt), txt))
+        elif "school:" in _norm(txt):
+            candidates.append((1, -len(txt), txt))
     if not candidates:
         return ""
     candidates.sort()
     seen = set()
     out: List[str] = []
-    for _, _, t in candidates:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
+    for _, _, txt in candidates:
+        if txt not in seen:
+            seen.add(txt)
+            out.append(txt)
     return "\n\n".join(out)
+
 
 def _fallback_block_by_alias(blob: str, canon: str) -> Optional[List[str]]:
     if not blob.strip():
         return None
     lines = blob.splitlines()
-    norm_lines = [_norm(ln) for ln in lines]
-    aliases = [_norm(canon)] + [_norm(a) for a in SCHOOL_ALIASES.get(canon, [])]
-    hit_idx = None
-    for i, ln in enumerate(norm_lines):
-        if any(tok in ln for tok in aliases):
-            hit_idx = i
-            break
-    if hit_idx is None:
-        return None
-    start = max(0, hit_idx - 3)
-    end = min(len(lines), hit_idx + 25)
-    for j in range(hit_idx + 1, end):
-        if lines[j].strip() == "---" or _looks_like_school_header(lines[j]):
-            end = j
-            break
-    return lines[start:end]
+    for idx, line in enumerate(lines):
+        if _school_header_canon(line) == canon:
+            return _extract_school_block(lines, idx)
+    return None
+
 
 def _infer_fields_from_freeblock(free_lines: List[str]) -> Dict[str, str]:
     txt = "\n".join(free_lines)
@@ -230,51 +259,99 @@ def _infer_fields_from_freeblock(free_lines: List[str]) -> Dict[str, str]:
     n = _norm(txt)
     inferred: Dict[str, str] = {}
 
-    # Type inference
-    if any(k in n for k in ["ninpo", "ninjutsu"]):
+    if any(term in n for term in ["ninpo", "ninjutsu"]):
         inferred["type"] = "Ninjutsu"
-    elif any(k in n for k in ["kosshijutsu", "koppojutsu", "dakentaijutsu", "jutaijutsu", "samurai"]):
+    elif "samurai school" in n or "samurai schools" in n:
         inferred["type"] = "Samurai"
 
-    # Translation inference
-    m = re.search(r'translation[: ]+["“](.+?)["”]', txt, flags=re.IGNORECASE)
-    if m:
-        inferred["translation"] = m.group(1).strip()
+    translation_match = re.search(r'translation[: ]+["“](.+?)["”]', txt, flags=re.IGNORECASE)
+    if translation_match:
+        inferred["translation"] = translation_match.group(1).strip()
 
-    # Focus inference
     focus_terms = []
-    for term in ["stealth", "infiltration", "surprise", "espionage", "distance", "timing", "kamae",
-                 "kosshijutsu", "koppojutsu", "striking", "bone", "joint", "throws", "grappling",
-                 "dakentaijutsu", "jutaijutsu"]:
+    for term in [
+        "stealth", "infiltration", "surprise", "espionage", "distance", "timing", "kamae",
+        "kosshijutsu", "koppojutsu", "striking", "bone", "joint", "throws", "grappling",
+        "dakentaijutsu", "jutaijutsu",
+    ]:
         if term in n:
             focus_terms.append(term)
     if focus_terms:
         inferred["focus"] = ", ".join(sorted(set(focus_terms)))
 
-    # Weapons inference
-    wterms = []
-    for term in ["shuriken", "senban", "kunai", "kodachi", "katana", "yari", "naginata", "bo", "hanbo",
-                 "kusarifundo", "kusari fundo", "kyoketsu shoge", "kyoketsu-shoge", "tessen", "jutte", "jitte"]:
+    weapon_terms = []
+    for term in [
+        "shuriken", "senban", "kunai", "kodachi", "katana", "yari", "naginata", "bo", "hanbo",
+        "kusarifundo", "kusari fundo", "kyoketsu shoge", "kyoketsu-shoge", "tessen", "jutte", "jitte",
+    ]:
         if term in n:
-            wterms.append(term)
-    if wterms:
-        inferred["weapons"] = ", ".join(sorted(set(wterms)))
+            weapon_terms.append(term)
+    if weapon_terms:
+        inferred["weapons"] = ", ".join(sorted(set(weapon_terms)))
 
     return inferred
 
+
+def _translation_matches_other_school(canon: str, translation: str) -> bool:
+    candidate = _norm(translation)
+    if not candidate:
+        return False
+    own = _norm((SCHOOL_PROFILE_SAFETY.get(canon) or {}).get("translation", ""))
+    if own and candidate == own:
+        return False
+    for other_canon, metadata in SCHOOL_PROFILE_SAFETY.items():
+        if other_canon == canon:
+            continue
+        other_translation = _norm(metadata.get("translation", ""))
+        if other_translation and candidate == other_translation:
+            return True
+    return False
+
+
+def _type_conflicts_with_school(canon: str, school_type: str) -> bool:
+    expected = _norm((SCHOOL_PROFILE_SAFETY.get(canon) or {}).get("type", ""))
+    actual = _norm(school_type)
+    return bool(expected and actual and actual != expected)
+
+
+def _finalize_school_fields(
+    canon: str,
+    fields: Dict[str, str],
+    *,
+    strict: bool,
+) -> Optional[Dict[str, str]]:
+    cleaned = {key: value.strip() for key, value in fields.items() if isinstance(value, str) and value.strip()}
+    if not cleaned:
+        return None
+
+    if _translation_matches_other_school(canon, cleaned.get("translation", "")):
+        return None
+    if strict and _type_conflicts_with_school(canon, cleaned.get("type", "")):
+        return None
+
+    safety = SCHOOL_PROFILE_SAFETY.get(canon) or {}
+    if not cleaned.get("translation") and safety.get("translation"):
+        cleaned["translation"] = safety["translation"]
+    if not cleaned.get("type") and safety.get("type"):
+        cleaned["type"] = safety["type"]
+    return cleaned
+
+
+def _extract_fields_from_school_block(
+    canon: str,
+    header: str,
+    body: List[str],
+) -> Optional[Dict[str, str]]:
+    parsed = _parse_fields(body)
+    if parsed:
+        return _finalize_school_fields(canon, parsed, strict=False)
+    inferred = _infer_fields_from_freeblock([header] + body)
+    return _finalize_school_fields(canon, inferred, strict=True)
+
+
 def _canon_from_header(header_line: str) -> Optional[str]:
-    h = _norm(header_line)
-    for canon, aliases in SCHOOL_ALIASES.items():
-        tokens = [_norm(canon)] + [_norm(a) for a in aliases]
-        if any(tok in h for tok in tokens):
-            return canon
-    m = re.search(r"([a-z0-9\- ]+)\s+ryu\b", h)
-    if m:
-        guess = m.group(1).strip().replace("-", " ")
-        for canon in SCHOOL_ALIASES.keys():
-            if _norm(canon).startswith(guess):
-                return canon
-    return None
+    return _school_header_canon(header_line)
+
 
 # ----------------------------
 # Public API (EXPORTED)
@@ -308,7 +385,6 @@ def try_answer_schools_list(
     if not names:
         return None
 
-    # Keep a stable/canonical order if we captured all nine
     canonical_order = [
         "Togakure Ryu",
         "Gyokushin Ryu",
@@ -321,8 +397,8 @@ def try_answer_schools_list(
         "Takagi Yoshin Ryu",
     ]
     if set(n.lower() for n in names) >= set(n.lower() for n in canonical_order):
-        order_map = {n.lower(): i for i, n in enumerate(canonical_order)}
-        names.sort(key=lambda s: order_map.get(s.lower(), 999))
+        order_map = {name.lower(): idx for idx, name in enumerate(canonical_order)}
+        names.sort(key=lambda name: order_map.get(name.lower(), 999))
 
     return build_result(
         det_path="schools/list",
@@ -338,6 +414,7 @@ def try_answer_schools_list(
         followup_suggestions=["Ask about one school if you want a short profile."],
     )
 
+
 def try_answer_school_profile(
     question: str,
     passages: List[Dict[str, Any]],
@@ -347,12 +424,12 @@ def try_answer_school_profile(
     """
     Return a compact profile for a single school (Translation / Type / Focus / Weapons / Notes).
 
-    IMPORTANT: If the query looks like a sōke/grandmaster query, return None so the leadership
+    IMPORTANT: If the query looks like a soke/grandmaster query, return None so the leadership
     extractor can take over.
     """
     ql = _norm(question)
-    if any(k in ql for k in ["soke", "sōke", "grandmaster"]):
-        return None  # leadership extractor should handle lineage/holders
+    if any(term in ql for term in ["soke", "grandmaster"]):
+        return None
 
     canon = _canon_for_query(question)
     if not canon:
@@ -363,29 +440,19 @@ def try_answer_school_profile(
         return None
 
     blocks = _slice_school_blocks(blob)
-
-    # First try exact header match, then fuzzy containment
     fields: Optional[Dict[str, str]] = None
+
     if blocks:
         for header, body in blocks:
             if _header_matches(header, canon):
-                fields = _parse_fields(body)
+                fields = _extract_fields_from_school_block(canon, header, body)
                 if fields:
                     break
-        if not fields:
-            cn = _norm(canon)
-            for header, body in blocks:
-                all_text = _norm(" ".join([header] + body))
-                if cn in all_text:
-                    fields = _parse_fields(body)
-                    if fields:
-                        break
 
-    # Fallback: heuristic extraction from a nearby free block
     if not fields:
         window = _fallback_block_by_alias(blob, canon)
         if window:
-            fields = _infer_fields_from_freeblock(window)
+            fields = _finalize_school_fields(canon, _infer_fields_from_freeblock(window), strict=True)
 
     if not fields:
         return None
