@@ -5,7 +5,7 @@ A RAG-based, extractor-driven chatbot for Ninja Training TV (NTTV).
 The stack centers on:
 - deterministic extractors for known-known questions
 - FAISS retrieval over embedded curriculum content
-- OpenRouter-compatible LLM generation
+- OpenRouter-compatible LLM generation with optional two-model routing
 - a local-first ingest pipeline that builds `index/` from `data/`
 
 ## Key Features
@@ -13,6 +13,7 @@ The stack centers on:
 - Deterministic extractors for rank requirements, kihon, sanshin, schools, weapons, kyusho, and related topics.
 - FAISS `IndexFlatIP` retrieval over normalized embeddings from `sentence-transformers/all-MiniLM-L6-v2`.
 - OpenRouter-compatible model routing through environment variables.
+- Optional stronger-model synthesis routing for explanation-heavy or multi-chunk grounded answers.
 - Shared ingest pipeline for `.txt`, `.md`, `.docx`, and now structured `.pdf` parsing.
 - Optional Docling-backed PDF ingestion with page-aware and heading-aware metadata.
 - Section-aware, metadata-rich chunking with stable chunk IDs and token-based controls.
@@ -61,7 +62,19 @@ Chunking:
 - fuses dense + lexical candidates with Reciprocal Rank Fusion (RRF)
 - applies priority-aware heuristics as a ranking stage
 - optionally reranks the fused shortlist with Jina and falls back safely to heuristic ordering
-- uses OpenRouter-compatible LLM calls for synthesis
+- uses OpenRouter-compatible LLM calls for answer synthesis
+
+### Two-Model Answer Routing
+
+`app.py` + `nttv_chatbot/llm_routing.py`:
+- keep `MODEL` as the primary lightweight/default model path
+- optionally use `SYNTHESIS_MODEL` for richer answer composition
+- route deterministic strict answers to the local deterministic composer by default
+- route explanation-heavy, interpretive, or multi-chunk retrieval answers to the synthesis model when enabled
+- build grounded prompts that only use provided facts/context, ask for citations, and explicitly admit incomplete material
+- cap context before model calls so higher-value chunks keep their source metadata
+- fall back cleanly to the primary model if the synthesis model errors or returns no text
+- expose routing decisions in debug mode, including model used, why it was chosen, and chunk/fact counts
 
 ### Deterministic Answers
 
@@ -97,6 +110,7 @@ nttv_chatbot_ext/
 |   |-- composer.py
 |   |-- deterministic.py
 |   |-- document_parsing.py
+|   |-- llm_routing.py
 |   |-- retrieval.py
 |   `-- llm_client.py
 |-- tests/
@@ -146,7 +160,12 @@ If you deploy to Render or another host and want PDF ingestion there too, instal
 |---|---|---|
 | `OPENAI_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter/OpenAI-compatible endpoint |
 | `OPENAI_API_KEY` | `sk-or-...` | API key |
-| `MODEL` | `google/gemma-3n-e4b-it` | Primary synthesis model |
+| `MODEL` | `google/gemma-3n-e4b-it` | Primary lightweight/default model |
+| `SYNTHESIS_MODEL` | `google/gemma-3-27b-it` | Optional stronger synthesis model |
+| `USE_SYNTHESIS_MODEL` | `true` | Enables routing to `SYNTHESIS_MODEL` when the prompt qualifies |
+| `SYNTHESIS_MIN_CONTEXT_CHUNKS` | `3` | Minimum retrieved chunks before multi-chunk synthesis routing kicks in |
+| `SYNTHESIS_FOR_EXPLANATION_MODE` | `true` | Allows explanation-style prompts to use the synthesis model |
+| `SYNTHESIS_FOR_DETERMINISTIC_COMPOSER` | `false` | Keeps deterministic answers local by default; opt in only if you want model-written deterministic composition |
 | `INDEX_DIR` | `index` | Index directory root |
 | `INDEX_PATH` | `index/faiss.index` | FAISS index path |
 | `META_PATH` | `index/meta.pkl` | Chunk metadata path |
@@ -189,6 +208,11 @@ If you deploy to Render or another host and want PDF ingestion there too, instal
 OPENAI_BASE_URL=https://openrouter.ai/api/v1
 OPENAI_API_KEY=sk-or-xxxx
 MODEL=google/gemma-3n-e4b-it
+SYNTHESIS_MODEL=google/gemma-3-27b-it
+USE_SYNTHESIS_MODEL=true
+SYNTHESIS_MIN_CONTEXT_CHUNKS=3
+SYNTHESIS_FOR_EXPLANATION_MODE=true
+SYNTHESIS_FOR_DETERMINISTIC_COMPOSER=false
 
 INDEX_DIR=index
 INDEX_PATH=index/faiss.index
@@ -216,6 +240,25 @@ TEMPERATURE=0.0
 MAX_TOKENS=512
 STREAMLIT_BROWSER_GATHERUSAGESTATS=false
 ```
+
+### Recommended Synthesis Routing
+
+Enable `USE_SYNTHESIS_MODEL=true` when you want better answer composition for:
+- explanation-heavy prompts such as `Explain Oni Kudaki` or `What's the difference between Omote Gyaku and Ura Gyaku?`
+- retrieval answers that need multiple ranked chunks woven together
+- broader grounded summaries where the material is present but wording quality matters
+
+Keep the default/local path for:
+- deterministic known-known questions such as rank requirements, school profiles, glossary facts, and weapon-rank lookups
+- direct fact lookups that only need one small chunk
+- cases where you want the cheapest and fastest path consistently
+
+Concrete example:
+- `MODEL=google/gemma-3n-e4b-it`
+- `SYNTHESIS_MODEL=google/gemma-3-27b-it`
+- `USE_SYNTHESIS_MODEL=true`
+
+That keeps the lightweight path as the default while letting a Gemma 3 variant handle richer grounded composition when routing decides it is worth the extra pass. If your provider uses a different identifier for Gemma 3, just swap the env var value; the implementation does not hardcode a vendor-specific model name.
 
 ## Build the Index
 
@@ -273,12 +316,17 @@ The retrieval stack is now stage-based and inspectable:
 - fusion uses Reciprocal Rank Fusion so dense-only hits and lexical-only hits can both survive
 - heuristics remain in the pipeline as a ranking stage instead of being the whole retriever
 - optional Jina reranking only touches the small fused shortlist and falls back safely if config or the API is unavailable
+- answer routing can keep the primary model for direct questions or switch to `SYNTHESIS_MODEL` for explanation-heavy/multi-chunk grounded answers
+- synthesis prompts explicitly require citations, disallow unsupported martial-arts lore, and tell the model to admit incomplete material
+- if synthesis fails, the app falls back to `MODEL` automatically
 
 Debug mode in `app.py` now shows:
 - dense candidates
 - lexical candidates
 - fused candidates
 - reranked candidates
+- answer route, requested model, final model used, and fallback reason when applicable
+- chunk/fact counts supplied to the final answer composer
 - deterministic result payloads still include `det_path`, confidence, facts, and source refs in the raw debug JSON
 - stage scores when available
 

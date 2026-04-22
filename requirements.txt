@@ -22,6 +22,7 @@ python-docx==1.2.0
 
 # --- OpenRouter client ---
 openai==1.52.2
+# Optional two-model routing reuses the same OpenAI-compatible HTTP stack; no extra package is required.
 
 # --- Tests / utils ---
 pytest==9.0.1

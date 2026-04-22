@@ -20,6 +20,13 @@ from nttv_chatbot.retrieval import (
     assemble_context as assemble_retrieval_context,
     search as search_retrieval_pipeline,
 )
+from nttv_chatbot.llm_routing import (
+    LLMRoutingSettings,
+    empty_route_debug,
+    filter_supporting_chunks,
+    generate_grounded_answer,
+    select_generation_route,
+)
 
 
 # Vector index
@@ -511,7 +518,17 @@ def _empty_retrieval_debug(reason: str) -> Dict[str, Any]:
         "reranker_backend_used": "none",
         "reranker_fallback_reason": reason,
         "deterministic_short_circuit": True,
+        "llm_routing": empty_route_debug(reason),
     }
+
+
+def _with_llm_routing_debug(
+    payload: Dict[str, Any],
+    llm_debug: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    merged = dict(payload)
+    merged["llm_routing"] = llm_debug or empty_route_debug("No answer routing details were recorded.")
+    return merged
 
 
 def _format_page_range(meta: Dict[str, Any]) -> str:
@@ -846,7 +863,47 @@ def _deterministic_output_format() -> str:
     return "bullets" if output_style == "Bullets" else "paragraph"
 
 
-def _compose_deterministic_result(result: DeterministicResult) -> Tuple[str, str]:
+def _compose_deterministic_result(
+    question: str,
+    result: DeterministicResult,
+    passages: List[Dict[str, Any]],
+) -> Tuple[str, str, Dict[str, Any]]:
+    supporting_passages = filter_supporting_chunks(passages, result.source_refs, limit=6)
+    route_decision = select_generation_route(
+        question,
+        supporting_passages,
+        fact_count=len(result.facts),
+        deterministic_mode=True,
+    )
+    strict_label = "🔒 Strict (context-only, explain)" if result.display_hints.get("explain", True) else "🔒 Strict (context-only)"
+
+    if route_decision.use_model:
+        generated = generate_grounded_answer(
+            question,
+            supporting_passages,
+            facts=result.facts,
+            source_refs=result.source_refs,
+            deterministic_mode=True,
+        )
+        if generated.text.strip():
+            return f"{strict_label}\n\n{generated.text.strip()}", generated.raw_json, generated.debug
+
+        route_debug = dict(generated.debug)
+        route_debug["model_used"] = "deterministic_composer"
+        route_debug["local_composer_fallback"] = True
+        route_debug["fallback_used"] = True
+        route_debug["fallback_reason"] = (
+            route_debug.get("fallback_reason")
+            or "Synthesis composition returned no text; used local deterministic composer."
+        )
+    else:
+        route_debug = route_decision.to_debug_payload(
+            model_used="deterministic_composer",
+            selected_chunk_count=len(supporting_passages),
+            selected_fact_count=len(result.facts),
+            context_char_count=0,
+        )
+
     body = compose_deterministic_answer(
         result,
         style=_detail_style(),
@@ -854,8 +911,7 @@ def _compose_deterministic_result(result: DeterministicResult) -> Tuple[str, str
         explanation_mode=True,
         tone=tone_style,
     )
-    strict_label = "🔒 Strict (context-only, explain)" if result.display_hints.get("explain", True) else "🔒 Strict (context-only)"
-    return f"{strict_label}\n\n{body}", json.dumps(result.to_dict(), ensure_ascii=False)
+    return f"{strict_label}\n\n{body}", json.dumps(result.to_dict(), ensure_ascii=False), route_debug
 
 
 def answer_single_technique_if_synthetic(
@@ -1394,7 +1450,7 @@ def _legacy_answer_with_rag(question: str, k: int | None = None) -> Tuple[str, L
 def _answer_from_passages(
     question: str,
     passages: List[Dict[str, Any]],
-) -> Optional[Tuple[str, List[Dict[str, Any]], str]]:
+) -> Optional[Tuple[str, List[Dict[str, Any]], str, Dict[str, Any]]]:
     fast = answer_single_technique_if_synthetic(
         passages,
         bullets=(output_style == "Bullets"),
@@ -1402,8 +1458,8 @@ def _answer_from_passages(
         detail_mode=TECH_DETAIL_MODE,
     )
     if fast:
-        answer_text, raw = _compose_deterministic_result(fast)
-        return answer_text, passages, raw
+        answer_text, raw, route_debug = _compose_deterministic_result(question, fast, passages)
+        return answer_text, passages, raw, route_debug
 
     if is_school_list_query(question):
         try:
@@ -1413,8 +1469,8 @@ def _answer_from_passages(
         except Exception:
             list_ans = None
         if list_ans:
-            answer_text, raw = _compose_deterministic_result(list_ans)
-            return answer_text, passages, raw
+            answer_text, raw, route_debug = _compose_deterministic_result(question, list_ans, passages)
+            return answer_text, passages, raw, route_debug
 
     if is_school_query(question):
         try:
@@ -1424,21 +1480,21 @@ def _answer_from_passages(
         except Exception:
             school_fact = None
         if school_fact:
-            answer_text, raw = _compose_deterministic_result(school_fact)
-            return answer_text, passages, raw
+            answer_text, raw, route_debug = _compose_deterministic_result(question, school_fact, passages)
+            return answer_text, passages, raw, route_debug
 
     try:
         wr = try_answer_weapon_rank(question, passages)
     except Exception:
         wr = None
     if wr:
-        answer_text, raw = _compose_deterministic_result(wr)
-        return answer_text, passages, raw
+        answer_text, raw, route_debug = _compose_deterministic_result(question, wr, passages)
+        return answer_text, passages, raw, route_debug
 
     fact = try_extract_answer(question, passages)
     if fact:
-        answer_text, raw = _compose_deterministic_result(fact)
-        return answer_text, passages, raw
+        answer_text, raw, route_debug = _compose_deterministic_result(question, fact, passages)
+        return answer_text, passages, raw, route_debug
 
     return None
 
@@ -1459,12 +1515,15 @@ def answer_with_rag(
     prepass_answer = _answer_from_passages(question, prepass_passages)
     if prepass_answer:
         _LAST_RETRIEVAL_RESULT = None
-        answer, hits, raw = prepass_answer
-        debug_payload = _empty_retrieval_debug("Deterministic extractor answered before retrieval.")
+        answer, hits, raw, route_debug = prepass_answer
+        debug_payload = _with_llm_routing_debug(
+            _empty_retrieval_debug("Deterministic extractor answered before retrieval."),
+            route_debug,
+        )
         return answer, hits, raw, debug_payload
 
     hits = retrieve(question, k=k)
-    retrieval_debug = get_last_retrieval_debug()
+    retrieval_debug = dict(get_last_retrieval_debug())
 
     hits = inject_rank_passage_if_needed(question, hits)
     hits = inject_leadership_passage_if_needed(question, hits)
@@ -1476,15 +1535,14 @@ def answer_with_rag(
 
     deterministic_answer = _answer_from_passages(question, hits)
     if deterministic_answer:
-        answer, det_hits, raw = deterministic_answer
-        return answer, det_hits, raw, retrieval_debug
+        answer, det_hits, raw, route_debug = deterministic_answer
+        return answer, det_hits, raw, _with_llm_routing_debug(retrieval_debug, route_debug)
 
-    ctx = build_context(hits)
-    prompt = build_prompt(ctx, question)
-    text, raw = call_llm(prompt)
-    if not text.strip():
-        return "🔒 Strict (context-only)\n\nModel returned no text.", hits, raw or "{}", retrieval_debug
-    return f"🔒 Strict (context-only, explain)\n\n{text.strip()}", hits, raw or "{}", retrieval_debug
+    generated = generate_grounded_answer(question, hits)
+    retrieval_debug = _with_llm_routing_debug(retrieval_debug, generated.debug)
+    if not generated.text.strip():
+        return "🔒 Strict (context-only)\n\nModel returned no text.", hits, generated.raw_json or "{}", retrieval_debug
+    return f"🔒 Strict (context-only, explain)\n\n{generated.text.strip()}", hits, generated.raw_json or "{}", retrieval_debug
 
 
 st.set_page_config(page_title="NTTV Chatbot (RAG)", page_icon="🥋", layout="wide")
@@ -1509,15 +1567,20 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**Backend**")
-    base = (
-        os.environ.get("OPENAI_BASE_URL")
-        or os.environ.get("OPENROUTER_API_BASE")
-        or os.environ.get("LM_STUDIO_BASE_URL")
-        or "http://localhost:1234/v1"
-    )
-    model = os.environ.get("MODEL", "gpt-4o-mini")
-    st.caption(f"LLM base: `{base}`")
-    st.caption(f"Model: `{model}`")
+    routing_settings = LLMRoutingSettings.from_env()
+    st.caption(f"LLM base: `{routing_settings.api_base}`")
+    st.caption(f"Primary model: `{routing_settings.primary_model}`")
+    if routing_settings.use_synthesis_model:
+        synthesis_label = routing_settings.synthesis_model or "(not set)"
+        st.caption(f"Synthesis model: `{synthesis_label}`")
+        st.caption(
+            "Synthesis routing: "
+            f"min_chunks={routing_settings.synthesis_min_context_chunks}, "
+            f"explanation={routing_settings.synthesis_for_explanation_mode}, "
+            f"deterministic={routing_settings.synthesis_for_deterministic_composer}"
+        )
+    else:
+        st.caption("Synthesis model routing: disabled")
     
     if show_debug:
         st.markdown("---")
@@ -1576,6 +1639,22 @@ if go and q.strip():
             _render_stage_candidates("Lexical candidates", retrieval_debug.get("lexical_candidates") or [])
             _render_stage_candidates("Fused candidates", retrieval_debug.get("fused_candidates") or [])
             _render_stage_candidates("Reranked candidates", retrieval_debug.get("reranked_candidates") or [])
+
+        llm_debug = retrieval_debug.get("llm_routing") or {}
+        if llm_debug:
+            st.markdown("### Answer Routing")
+            st.caption(
+                f"Route: {llm_debug.get('route')} | "
+                f"model used: {llm_debug.get('model_used') or 'none'} | "
+                f"requested: {llm_debug.get('model_requested') or 'none'}"
+            )
+            st.caption(f"Reason: {llm_debug.get('reason') or 'n/a'}")
+            st.caption(
+                f"Chunks supplied: {llm_debug.get('selected_chunk_count', 0)} / {llm_debug.get('input_chunk_count', 0)} | "
+                f"Facts supplied: {llm_debug.get('selected_fact_count', 0)} / {llm_debug.get('input_fact_count', 0)}"
+            )
+            if llm_debug.get("fallback_used"):
+                st.caption(f"Model fallback: {llm_debug.get('fallback_reason')}")
 
         st.markdown("### Final Answer Sources")
         for i, h in enumerate(top_passages, 1):

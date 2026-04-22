@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import app
@@ -132,6 +133,13 @@ def test_deterministic_extractors_short_circuit_before_retrieval(monkeypatch):
         "retrieve",
         lambda question, k=None: (_ for _ in ()).throw(AssertionError("retrieve should not run")),
     )
+    monkeypatch.setattr(
+        app,
+        "generate_grounded_answer",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("generate_grounded_answer should not run for deterministic answers")
+        ),
+    )
     monkeypatch.setattr(app, "output_style", "Bullets", raising=False)
     monkeypatch.setattr(app, "tone_style", "Crisp", raising=False)
     monkeypatch.setattr(app, "TECH_DETAIL_MODE", "Standard", raising=False)
@@ -142,3 +150,70 @@ def test_deterministic_extractors_short_circuit_before_retrieval(monkeypatch):
     assert passages == []
     assert "det_path" in raw_json
     assert retrieval_debug["deterministic_short_circuit"] is True
+    assert retrieval_debug["llm_routing"]["model_used"] == "deterministic_composer"
+    assert retrieval_debug["llm_routing"]["route"] == "deterministic_local"
+
+
+def test_answer_with_rag_debug_includes_llm_routing_details(monkeypatch):
+    hits = [
+        _chunk("c1", "Training progression overview from the curriculum.", source="data/nttv training reference.txt"),
+        _chunk("c2", "Additional explanation-heavy curriculum context.", source="data/Kaname.txt"),
+        _chunk("c3", "Supporting context for interpretation.", source="data/What is Buyu.txt"),
+    ]
+
+    monkeypatch.setattr(app, "_load_index_and_meta", lambda: (None, []))
+    monkeypatch.setattr(app, "retrieve", lambda question, k=None: hits)
+    monkeypatch.setattr(
+        app,
+        "get_last_retrieval_debug",
+        lambda: {
+            "dense_candidates": [],
+            "lexical_candidates": [],
+            "fused_candidates": [],
+            "reranked_candidates": [],
+            "final_candidates": hits,
+            "reranker_backend_requested": "none",
+            "reranker_backend_used": "none",
+            "reranker_fallback_reason": None,
+        },
+    )
+    monkeypatch.setattr(
+        app,
+        "generate_grounded_answer",
+        lambda question, context_chunks: SimpleNamespace(
+            text="Grounded explanation [1][2].",
+            raw_json='{"id":"llm-response"}',
+            debug={
+                "route": "synthesis",
+                "model_requested": "google/gemma-3-27b-it",
+                "model_used": "google/gemma-3-27b-it",
+                "reason": "Synthesis model selected for explanation-style wording, 3 context chunks.",
+                "reason_codes": ["explanation_mode", "multi_chunk_context"],
+                "deterministic_mode": False,
+                "explanation_mode": True,
+                "interpretive_question": False,
+                "input_chunk_count": 3,
+                "selected_chunk_count": 3,
+                "input_fact_count": 0,
+                "selected_fact_count": 0,
+                "context_char_count": 512,
+                "fallback_used": False,
+                "fallback_reason": None,
+                "attempted_models": ["google/gemma-3-27b-it"],
+            },
+        ),
+    )
+    monkeypatch.setattr(app, "output_style", "Bullets", raising=False)
+    monkeypatch.setattr(app, "tone_style", "Crisp", raising=False)
+    monkeypatch.setattr(app, "TECH_DETAIL_MODE", "Standard", raising=False)
+
+    answer, passages, raw_json, retrieval_debug = app.answer_with_rag(
+        "Why is the curriculum organized this way?"
+    )
+
+    assert "Grounded explanation" in answer
+    assert passages == hits
+    assert raw_json == '{"id":"llm-response"}'
+    assert retrieval_debug["llm_routing"]["route"] == "synthesis"
+    assert retrieval_debug["llm_routing"]["model_used"] == "google/gemma-3-27b-it"
+    assert retrieval_debug["llm_routing"]["selected_chunk_count"] == 3
