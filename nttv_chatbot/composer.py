@@ -520,4 +520,4 @@ def _apply_chatty_tone(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", text.strip())
     if cleaned.endswith("?"):
         return cleaned
-    return cleaned + " If you want, I can keep it concise or unpack one part further."
+    return cleaned + " If you want, I can keep it concise or go deeper on this topic."

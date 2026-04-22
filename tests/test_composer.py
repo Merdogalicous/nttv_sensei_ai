@@ -68,3 +68,16 @@ def test_composer_brief_standard_full_styles_differ():
     assert "Rank intro" in standard
     assert "Safety" in full
     assert "Partner required" in full
+
+
+def test_chatty_paragraph_followup_line_matches_supported_behavior():
+    rendered = compose_deterministic_answer(
+        _technique_result(),
+        style="standard",
+        output_format="paragraph",
+        tone="chatty",
+    )
+
+    low = rendered.lower()
+    assert "go deeper on this topic" in low
+    assert "unpack one part further" not in low

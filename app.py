@@ -2,7 +2,8 @@
 import os
 import json
 import pickle
-from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Dict, Any, MutableMapping, Optional, Tuple
 import re
 import unicodedata
 
@@ -12,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from nttv_chatbot.composer import compose_deterministic_answer
-from nttv_chatbot.deterministic import DeterministicResult, build_result
+from nttv_chatbot.deterministic import DeterministicResult, SourceRef, build_result
 from nttv_chatbot.retrieval import (
     LexicalRetriever,
     RetrievalResult,
@@ -54,6 +55,7 @@ from extractors.schools import (
 )
 
 from extractors.technique_match import (
+    canonical_from_query as _canonical_technique_from_query,
     is_single_technique_query as _is_single_technique_query,
     technique_name_variants as _tech_name_variants,
 )
@@ -552,6 +554,233 @@ def _format_detected_tags(meta: Dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
+_SESSION_FOLLOWUP_STATE_KEY = "last_answer_state"
+_VAGUE_FOLLOWUP_PHRASES = {
+    "unpack one part further",
+    "go deeper",
+    "say more",
+    "expand on that",
+    "tell me more",
+    "can you explain that more",
+    "break that down",
+}
+_FOLLOWUP_CLARIFICATION = "I can do that, but I need to know what you want me to unpack further."
+_EMPTY_GROUNDED_ANSWER = (
+    "I couldn't produce a grounded answer from the available material. "
+    "Please name the topic more directly."
+)
+
+
+@dataclass(frozen=True)
+class FollowupResolution:
+    original_question: str
+    effective_question: str
+    is_vague_followup: bool = False
+    used_prior_topic: bool = False
+    resolved_topic: Optional[str] = None
+    clarification_text: Optional[str] = None
+    cached_result: Optional[DeterministicResult] = None
+
+    @property
+    def needs_clarification(self) -> bool:
+        return bool(self.clarification_text)
+
+
+def _normalize_followup_prompt(question: str) -> str:
+    normalized = re.sub(r"[^a-z0-9\s]", " ", (question or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized.startswith("please "):
+        normalized = normalized[7:].strip()
+    if normalized.endswith(" please"):
+        normalized = normalized[:-7].strip()
+    return normalized
+
+
+def is_vague_followup_prompt(question: str) -> bool:
+    return _normalize_followup_prompt(question) in _VAGUE_FOLLOWUP_PHRASES
+
+
+def _get_followup_state(
+    session_state: Optional[MutableMapping[str, Any]],
+) -> Dict[str, Any]:
+    if session_state is None:
+        return {}
+    raw = session_state.get(_SESSION_FOLLOWUP_STATE_KEY)
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _serialize_source_refs(source_refs: list[SourceRef]) -> list[dict[str, Any]]:
+    return [ref.to_dict() for ref in source_refs]
+
+
+def _restore_source_refs(raw_refs: Any) -> list[SourceRef]:
+    refs: list[SourceRef] = []
+    for raw_ref in raw_refs or []:
+        if isinstance(raw_ref, SourceRef):
+            refs.append(raw_ref)
+            continue
+        if not isinstance(raw_ref, dict):
+            continue
+        refs.append(
+            SourceRef(
+                source=str(raw_ref.get("source") or ""),
+                page_start=raw_ref.get("page_start"),
+                page_end=raw_ref.get("page_end"),
+                heading_path=list(raw_ref.get("heading_path") or []),
+                chunk_id=raw_ref.get("chunk_id"),
+            )
+        )
+    return refs
+
+
+def _resolved_topic_from_result(result: DeterministicResult) -> Optional[str]:
+    facts = result.facts
+    if result.answer_type == "technique":
+        return facts.get("technique_name")
+    if result.answer_type == "technique_diff":
+        left_name = ((facts.get("left") or {}).get("technique_name") or "").strip()
+        right_name = ((facts.get("right") or {}).get("technique_name") or "").strip()
+        if left_name and right_name:
+            return f"{left_name} and {right_name}"
+        return left_name or right_name or None
+    if result.answer_type in {"school_profile", "school_list"}:
+        return facts.get("school_name") or facts.get("list_title")
+    if result.answer_type in {"weapon_profile", "weapon_rank", "weapon_parts", "weapon_classification"}:
+        return facts.get("weapon_name") or facts.get("title")
+    if result.answer_type == "glossary_term":
+        return facts.get("term")
+    if result.answer_type == "kyusho_point":
+        return facts.get("point_name")
+    if result.answer_type == "leadership":
+        return facts.get("soke_name") or facts.get("school_name")
+    if result.answer_type == "sanshin_element":
+        return facts.get("element_name")
+    if result.answer_type in {"sanshin_list", "sanshin_overview"}:
+        return facts.get("title") or "Sanshin no Kata"
+    if result.answer_type == "kihon_happo":
+        return "Kihon Happo"
+    if result.answer_type.startswith("rank_") or result.answer_type == "rank_requirements":
+        return facts.get("rank")
+    return None
+
+
+def _resolved_topic_from_question(question: str) -> Optional[str]:
+    return _canonical_technique_from_query(question)
+
+
+def _restore_deterministic_result(state: Dict[str, Any]) -> Optional[DeterministicResult]:
+    det_path = (state.get("last_det_path") or "").strip()
+    answer_type = (state.get("last_answer_type") or "").strip()
+    facts = state.get("last_facts")
+    if not det_path or not answer_type or not isinstance(facts, dict) or not facts:
+        return None
+    return DeterministicResult(
+        answered=True,
+        det_path=det_path,
+        answer_type=answer_type,
+        facts=dict(facts),
+        source_refs=_restore_source_refs(state.get("last_source_refs")),
+        confidence=float(state.get("last_confidence") or 1.0),
+        display_hints=dict(state.get("last_display_hints") or {}),
+        followup_suggestions=list(state.get("last_followup_suggestions") or []),
+    )
+
+
+def _rewrite_vague_followup(topic: str) -> str:
+    clean_topic = (topic or "").strip().rstrip(".!?")
+    return f"Explain {clean_topic} in more detail."
+
+
+def resolve_followup_question(
+    question: str,
+    session_state: Optional[MutableMapping[str, Any]] = None,
+) -> FollowupResolution:
+    original_question = (question or "").strip()
+    if not is_vague_followup_prompt(original_question):
+        return FollowupResolution(
+            original_question=original_question,
+            effective_question=original_question,
+        )
+
+    state = _get_followup_state(session_state)
+    topic = (state.get("last_resolved_topic") or "").strip()
+    if not topic:
+        return FollowupResolution(
+            original_question=original_question,
+            effective_question=original_question,
+            is_vague_followup=True,
+            clarification_text=_FOLLOWUP_CLARIFICATION,
+        )
+
+    return FollowupResolution(
+        original_question=original_question,
+        effective_question=_rewrite_vague_followup(topic),
+        is_vague_followup=True,
+        used_prior_topic=True,
+        resolved_topic=topic,
+        cached_result=_restore_deterministic_result(state),
+    )
+
+
+def _remember_last_answer(
+    session_state: Optional[MutableMapping[str, Any]],
+    *,
+    original_question: str,
+    effective_question: str,
+    answer_text: str,
+    deterministic_result: Optional[DeterministicResult] = None,
+) -> None:
+    if session_state is None:
+        return
+
+    resolved_topic = None
+    if deterministic_result is not None:
+        resolved_topic = _resolved_topic_from_result(deterministic_result)
+    if not resolved_topic:
+        resolved_topic = _resolved_topic_from_question(effective_question) or _resolved_topic_from_question(original_question)
+
+    session_state[_SESSION_FOLLOWUP_STATE_KEY] = {
+        "last_user_question": original_question,
+        "last_effective_question": effective_question,
+        "last_answer_text": answer_text.strip(),
+        "last_det_path": deterministic_result.det_path if deterministic_result else None,
+        "last_answer_type": deterministic_result.answer_type if deterministic_result else "grounded_generation",
+        "last_facts": dict(deterministic_result.facts) if deterministic_result else {},
+        "last_source_refs": _serialize_source_refs(deterministic_result.source_refs) if deterministic_result else [],
+        "last_resolved_topic": resolved_topic,
+        "last_confidence": deterministic_result.confidence if deterministic_result else None,
+        "last_display_hints": dict(deterministic_result.display_hints) if deterministic_result else {},
+        "last_followup_suggestions": list(deterministic_result.followup_suggestions) if deterministic_result else [],
+    }
+
+
+def _with_followup_debug(
+    payload: Dict[str, Any],
+    resolution: FollowupResolution,
+) -> Dict[str, Any]:
+    merged = dict(payload)
+    if resolution.is_vague_followup:
+        merged["followup"] = {
+            "original_question": resolution.original_question,
+            "effective_question": resolution.effective_question,
+            "used_prior_topic": resolution.used_prior_topic,
+            "resolved_topic": resolution.resolved_topic,
+            "needs_clarification": resolution.needs_clarification,
+        }
+    return merged
+
+
+def _empty_answer_text(resolution: FollowupResolution) -> str:
+    if resolution.is_vague_followup and resolution.resolved_topic:
+        return (
+            f"I can unpack {resolution.resolved_topic} further, "
+            "but I need a more specific angle to stay grounded."
+        )
+    if resolution.is_vague_followup:
+        return _FOLLOWUP_CLARIFICATION
+    return _EMPTY_GROUNDED_ANSWER
+
+
 def _format_score(value: Any) -> str:
     if value is None:
         return "n/a"
@@ -867,6 +1096,8 @@ def _compose_deterministic_result(
     question: str,
     result: DeterministicResult,
     passages: List[Dict[str, Any]],
+    *,
+    style_override: Optional[str] = None,
 ) -> Tuple[str, str, Dict[str, Any]]:
     supporting_passages = filter_supporting_chunks(passages, result.source_refs, limit=6)
     route_decision = select_generation_route(
@@ -906,7 +1137,7 @@ def _compose_deterministic_result(
 
     body = compose_deterministic_answer(
         result,
-        style=_detail_style(),
+        style=style_override or _detail_style(),
         output_format=_deterministic_output_format(),
         explanation_mode=True,
         tone=tone_style,
@@ -1386,7 +1617,7 @@ def _legacy_answer_with_rag(question: str, k: int | None = None) -> Tuple[str, L
         prompt = build_prompt(ctx, question)
         text, raw = call_llm(prompt)
         if not text.strip():
-            return "🔒 Strict (context-only)\n\n❌ Model returned no text.", hits, raw or "{}"
+            return _EMPTY_GROUNDED_ANSWER, hits, raw or "{}"
         return f"🔒 Strict (context-only, explain)\n\n{text.strip()}", hits, raw or "{}"
 
     # Leadership short-circuit (generic)
@@ -1440,7 +1671,7 @@ def _legacy_answer_with_rag(question: str, k: int | None = None) -> Tuple[str, L
     prompt = build_prompt(ctx, question)
     text, raw = call_llm(prompt)
     if not text.strip():
-        return "🔒 Strict (context-only)\n\n❌ Model returned no text.", hits, raw or "{}"
+        return _EMPTY_GROUNDED_ANSWER, hits, raw or "{}"
     return f"🔒 Strict (context-only, explain)\n\n{text.strip()}", hits, raw or "{}"
 
 
@@ -1450,7 +1681,7 @@ def _legacy_answer_with_rag(question: str, k: int | None = None) -> Tuple[str, L
 def _answer_from_passages(
     question: str,
     passages: List[Dict[str, Any]],
-) -> Optional[Tuple[str, List[Dict[str, Any]], str, Dict[str, Any]]]:
+) -> Optional[Tuple[str, List[Dict[str, Any]], str, Dict[str, Any], DeterministicResult]]:
     fast = answer_single_technique_if_synthetic(
         passages,
         bullets=(output_style == "Bullets"),
@@ -1459,7 +1690,7 @@ def _answer_from_passages(
     )
     if fast:
         answer_text, raw, route_debug = _compose_deterministic_result(question, fast, passages)
-        return answer_text, passages, raw, route_debug
+        return answer_text, passages, raw, route_debug, fast
 
     if is_school_list_query(question):
         try:
@@ -1470,7 +1701,7 @@ def _answer_from_passages(
             list_ans = None
         if list_ans:
             answer_text, raw, route_debug = _compose_deterministic_result(question, list_ans, passages)
-            return answer_text, passages, raw, route_debug
+            return answer_text, passages, raw, route_debug, list_ans
 
     if is_school_query(question):
         try:
@@ -1481,7 +1712,7 @@ def _answer_from_passages(
             school_fact = None
         if school_fact:
             answer_text, raw, route_debug = _compose_deterministic_result(question, school_fact, passages)
-            return answer_text, passages, raw, route_debug
+            return answer_text, passages, raw, route_debug, school_fact
 
     try:
         wr = try_answer_weapon_rank(question, passages)
@@ -1489,14 +1720,31 @@ def _answer_from_passages(
         wr = None
     if wr:
         answer_text, raw, route_debug = _compose_deterministic_result(question, wr, passages)
-        return answer_text, passages, raw, route_debug
+        return answer_text, passages, raw, route_debug, wr
 
     fact = try_extract_answer(question, passages)
     if fact:
         answer_text, raw, route_debug = _compose_deterministic_result(question, fact, passages)
-        return answer_text, passages, raw, route_debug
+        return answer_text, passages, raw, route_debug, fact
 
     return None
+
+
+def _answer_from_cached_followup_result(
+    question: str,
+    result: DeterministicResult,
+) -> Tuple[str, List[Dict[str, Any]], str, Dict[str, Any]]:
+    answer_text, raw, route_debug = _compose_deterministic_result(
+        question,
+        result,
+        [],
+        style_override="full",
+    )
+    debug_payload = _with_llm_routing_debug(
+        _empty_retrieval_debug("Reused prior deterministic answer for a vague follow-up."),
+        route_debug,
+    )
+    return answer_text, [], raw, debug_payload
 
 
 # --------------------------------------------------------------------
@@ -1505,44 +1753,99 @@ def _answer_from_passages(
 def answer_with_rag(
     question: str,
     k: int | None = None,
+    *,
+    session_state: Optional[MutableMapping[str, Any]] = None,
 ) -> Tuple[str, List[Dict[str, Any]], str, Dict[str, Any]]:
     global _LAST_RETRIEVAL_RESULT
 
     if k is None:
         k = TOP_K
 
-    prepass_passages = _prepare_deterministic_passages(question)
-    prepass_answer = _answer_from_passages(question, prepass_passages)
+    resolution = resolve_followup_question(question, session_state)
+    effective_question = resolution.effective_question
+
+    if resolution.needs_clarification:
+        _LAST_RETRIEVAL_RESULT = None
+        debug_payload = _with_followup_debug(
+            _empty_retrieval_debug("Vague follow-up requested without a prior resolved topic."),
+            resolution,
+        )
+        return resolution.clarification_text or _FOLLOWUP_CLARIFICATION, [], "{}", debug_payload
+
+    if resolution.cached_result is not None:
+        _LAST_RETRIEVAL_RESULT = None
+        answer, hits, raw, retrieval_debug = _answer_from_cached_followup_result(
+            effective_question,
+            resolution.cached_result,
+        )
+        retrieval_debug = _with_followup_debug(retrieval_debug, resolution)
+        _remember_last_answer(
+            session_state,
+            original_question=resolution.original_question,
+            effective_question=effective_question,
+            answer_text=answer,
+            deterministic_result=resolution.cached_result,
+        )
+        return answer, hits, raw, retrieval_debug
+
+    prepass_passages = _prepare_deterministic_passages(effective_question)
+    prepass_answer = _answer_from_passages(effective_question, prepass_passages)
     if prepass_answer:
         _LAST_RETRIEVAL_RESULT = None
-        answer, hits, raw, route_debug = prepass_answer
-        debug_payload = _with_llm_routing_debug(
+        answer, hits, raw, route_debug, det_result = prepass_answer
+        retrieval_debug = _with_llm_routing_debug(
             _empty_retrieval_debug("Deterministic extractor answered before retrieval."),
             route_debug,
         )
-        return answer, hits, raw, debug_payload
+        retrieval_debug = _with_followup_debug(retrieval_debug, resolution)
+        _remember_last_answer(
+            session_state,
+            original_question=resolution.original_question,
+            effective_question=effective_question,
+            answer_text=answer,
+            deterministic_result=det_result,
+        )
+        return answer, hits, raw, retrieval_debug
 
-    hits = retrieve(question, k=k)
+    hits = retrieve(effective_question, k=k)
     retrieval_debug = dict(get_last_retrieval_debug())
 
-    hits = inject_rank_passage_if_needed(question, hits)
-    hits = inject_leadership_passage_if_needed(question, hits)
-    hits = inject_schools_passage_if_needed(question, hits)
-    hits = inject_weapons_passage_if_needed(question, hits)
-    hits = inject_kihon_passage_if_needed(question, hits)
-    hits = inject_techniques_passage_if_needed(question, hits)
-    hits = inject_specific_technique_line_if_needed(question, hits)
+    hits = inject_rank_passage_if_needed(effective_question, hits)
+    hits = inject_leadership_passage_if_needed(effective_question, hits)
+    hits = inject_schools_passage_if_needed(effective_question, hits)
+    hits = inject_weapons_passage_if_needed(effective_question, hits)
+    hits = inject_kihon_passage_if_needed(effective_question, hits)
+    hits = inject_techniques_passage_if_needed(effective_question, hits)
+    hits = inject_specific_technique_line_if_needed(effective_question, hits)
 
-    deterministic_answer = _answer_from_passages(question, hits)
+    deterministic_answer = _answer_from_passages(effective_question, hits)
     if deterministic_answer:
-        answer, det_hits, raw, route_debug = deterministic_answer
-        return answer, det_hits, raw, _with_llm_routing_debug(retrieval_debug, route_debug)
+        answer, det_hits, raw, route_debug, det_result = deterministic_answer
+        retrieval_debug = _with_llm_routing_debug(retrieval_debug, route_debug)
+        retrieval_debug = _with_followup_debug(retrieval_debug, resolution)
+        _remember_last_answer(
+            session_state,
+            original_question=resolution.original_question,
+            effective_question=effective_question,
+            answer_text=answer,
+            deterministic_result=det_result,
+        )
+        return answer, det_hits, raw, retrieval_debug
 
-    generated = generate_grounded_answer(question, hits)
+    generated = generate_grounded_answer(effective_question, hits)
     retrieval_debug = _with_llm_routing_debug(retrieval_debug, generated.debug)
+    retrieval_debug = _with_followup_debug(retrieval_debug, resolution)
     if not generated.text.strip():
-        return "🔒 Strict (context-only)\n\nModel returned no text.", hits, generated.raw_json or "{}", retrieval_debug
-    return f"🔒 Strict (context-only, explain)\n\n{generated.text.strip()}", hits, generated.raw_json or "{}", retrieval_debug
+        return _empty_answer_text(resolution), hits, generated.raw_json or "{}", retrieval_debug
+
+    answer = f"\U0001F512 Strict (context-only, explain)\n\n{generated.text.strip()}"
+    _remember_last_answer(
+        session_state,
+        original_question=resolution.original_question,
+        effective_question=effective_question,
+        answer_text=answer,
+    )
+    return answer, hits, generated.raw_json or "{}", retrieval_debug
 
 
 st.set_page_config(page_title="NTTV Chatbot (RAG)", page_icon="🥋", layout="wide")
@@ -1612,7 +1915,10 @@ go = st.button("Ask", type="primary")
 if go and q.strip():
     try:
         with st.spinner("Thinking..."):
-            ans, top_passages, raw_json, retrieval_debug = answer_with_rag(q.strip())
+            ans, top_passages, raw_json, retrieval_debug = answer_with_rag(
+                q.strip(),
+                session_state=st.session_state,
+            )
     except Exception as e:
         st.error(f"Backend error: {e}")
         if show_debug:
