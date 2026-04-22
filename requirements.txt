@@ -27,7 +27,7 @@ openai==1.52.2
 # --- Tests / utils ---
 pytest==9.0.1
 
-# --- YAML (already pinned for Render) ---
+# --- YAML / eval question files ---
 PyYAML==6.0.2
 
 # --- API Server ---

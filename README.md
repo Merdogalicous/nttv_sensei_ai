@@ -14,6 +14,7 @@ The stack centers on:
 - FAISS `IndexFlatIP` retrieval over normalized embeddings from `sentence-transformers/all-MiniLM-L6-v2`.
 - OpenRouter-compatible model routing through environment variables.
 - Optional stronger-model synthesis routing for explanation-heavy or multi-chunk grounded answers.
+- Local eval harness for deterministic, retrieval, ambiguous, and out-of-scope question sets.
 - Shared ingest pipeline for `.txt`, `.md`, `.docx`, and now structured `.pdf` parsing.
 - Optional Docling-backed PDF ingestion with page-aware and heading-aware metadata.
 - Section-aware, metadata-rich chunking with stable chunk IDs and token-based controls.
@@ -100,6 +101,7 @@ This keeps routing and factual correctness in the extractors while moving wordin
 nttv_chatbot_ext/
 |-- app.py
 |-- api_server.py
+|-- evals/
 |-- ingest.py
 |-- extractors/
 |-- data/
@@ -110,10 +112,12 @@ nttv_chatbot_ext/
 |   |-- composer.py
 |   |-- deterministic.py
 |   |-- document_parsing.py
+|   |-- eval_harness.py
 |   |-- llm_routing.py
 |   |-- retrieval.py
 |   `-- llm_client.py
 |-- tests/
+|-- tools/
 |-- requirements.txt
 |-- render.yaml
 `-- README.md
@@ -320,6 +324,85 @@ The retrieval stack is now stage-based and inspectable:
 - synthesis prompts explicitly require citations, disallow unsupported martial-arts lore, and tell the model to admit incomplete material
 - if synthesis fails, the app falls back to `MODEL` automatically
 
+## Evaluation Harness
+
+The repo now includes a local eval harness so you can compare baseline vs improved retrieval/composition/model-routing behavior without manual UI testing.
+
+Files:
+- `evals/questions.jsonl` contains the seed question set
+- `tools/run_evals.py` runs the local pipeline directly
+- `nttv_chatbot/eval_harness.py` loads cases, scores them, and writes reports
+
+Each eval record supports:
+- `id`
+- `question`
+- `category`
+- `expected_keywords`
+- `expected_det_path`
+- `expected_sources`
+- `should_refuse`
+- optional answer length bounds via `min_answer_chars` / `max_answer_chars`
+
+Seed coverage includes:
+- deterministic known-known questions
+- retrieval-grounded explanation queries
+- ambiguous interpretive prompts
+- clearly unsupported or out-of-scope prompts
+
+### Run Evals
+
+Run the full suite:
+
+```powershell
+.\.venv\Scripts\python.exe tools\run_evals.py --label baseline
+```
+
+Run only one category:
+
+```powershell
+.\.venv\Scripts\python.exe tools\run_evals.py --category deterministic --label det-only
+```
+
+Run with a synthesis-heavy config:
+
+```powershell
+$env:MODEL="google/gemma-3n-e4b-it"
+$env:SYNTHESIS_MODEL="google/gemma-3-27b-it"
+$env:USE_SYNTHESIS_MODEL="true"
+$env:SYNTHESIS_MIN_CONTEXT_CHUNKS="3"
+$env:SYNTHESIS_FOR_EXPLANATION_MODE="true"
+$env:SYNTHESIS_FOR_DETERMINISTIC_COMPOSER="false"
+
+.\.venv\Scripts\python.exe tools\run_evals.py --label gemma3-synthesis
+```
+
+Outputs are written to `evals/results/`:
+- `<label>.md` for a human-readable report
+- `<label>.csv` for row-by-row comparison in spreadsheets or diffs
+
+The markdown report includes:
+- overall score and pass rate
+- category-level summaries
+- model usage counts
+- per-case route/model/det-path/source summaries
+- a `Needs Review` section for weaker cases
+
+The CSV includes:
+- answer text
+- score breakdown fields
+- deterministic-routing flags
+- source coverage
+- route/model selection details
+
+### Compare Configurations
+
+The easiest comparison workflow is:
+1. Run `tools/run_evals.py --label baseline`
+2. Change env vars or code
+3. Run `tools/run_evals.py --label improved`
+4. Compare `evals/results/baseline.md` vs `evals/results/improved.md`
+5. Compare the CSVs for row-level deltas
+
 Debug mode in `app.py` now shows:
 - dense candidates
 - lexical candidates
@@ -447,6 +530,12 @@ Run the retrieval tests:
 
 ```bash
 pytest tests/test_retrieval.py
+```
+
+Run the eval harness tests:
+
+```bash
+pytest tests/test_eval_harness.py
 ```
 
 ## License
