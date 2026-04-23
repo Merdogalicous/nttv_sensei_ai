@@ -92,6 +92,23 @@ def test_specific_kamae_definition_uses_technique_shape():
     assert ans.facts["type"] == "Kamae"
     assert ans.facts["rank_context"] == "9th Kyu"
     assert "balance" in (ans.facts["definition"] or "").lower()
+    assert "hoko no kamae" not in (ans.facts["definition"] or "").lower()
+    assert "kosei no kamae" not in (ans.facts["definition"] or "").lower()
+    assert any("technique descriptions.md" in ref.source.lower() for ref in ans.source_refs)
+
+
+def test_jumonji_description_stays_bounded_to_its_own_record():
+    ans = try_answer_kamae("describe Jumonji no Kamae", _passages())
+
+    assert ans and ans.answer_type == "technique"
+    assert ans.det_path == "kamae/specific"
+    assert ans.facts["technique_name"] == "Jumonji no Kamae"
+    assert ans.facts["translation"] == "Cross Posture"
+    definition = (ans.facts["definition"] or "").lower()
+    assert "crossed in front" in definition
+    assert "hicho no kamae" not in definition
+    assert "hoko no kamae" not in definition
+    assert "kosei no kamae" not in definition
     assert any("technique descriptions.md" in ref.source.lower() for ref in ans.source_refs)
 
 
@@ -138,6 +155,43 @@ def test_answer_with_rag_rank_kamae_short_circuits_before_llm(monkeypatch):
     assert "Hicho no Kamae" in answer
     assert passages
     assert '"det_path": "rank/kamae"' in raw_json
+    assert retrieval_debug["deterministic_short_circuit"] is True
+    assert retrieval_debug["llm_routing"]["model_used"] == "deterministic_composer"
+    assert retrieval_debug["llm_routing"]["route"] == "deterministic_local"
+
+
+def test_answer_with_rag_specific_kamae_short_circuits_before_llm(monkeypatch):
+    chunks = [
+        _chunk(
+            "technique",
+            TECH.read_text(encoding="utf-8"),
+            source="Technique Descriptions.md",
+        )
+    ]
+
+    monkeypatch.setattr(app, "_load_index_and_meta", lambda: (None, chunks))
+    monkeypatch.setattr(
+        app,
+        "retrieve",
+        lambda question, k=None: (_ for _ in ()).throw(AssertionError("retrieve should not run")),
+    )
+    monkeypatch.setattr(
+        app,
+        "generate_grounded_answer",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("generate_grounded_answer should not run for deterministic kamae answers")
+        ),
+    )
+    monkeypatch.setattr(app, "output_style", "Bullets", raising=False)
+    monkeypatch.setattr(app, "tone_style", "Crisp", raising=False)
+    monkeypatch.setattr(app, "TECH_DETAIL_MODE", "Standard", raising=False)
+
+    answer, passages, raw_json, retrieval_debug = app.answer_with_rag("describe Jumonji no Kamae")
+
+    assert "Jumonji no Kamae" in answer
+    assert "Hicho no Kamae" not in answer
+    assert passages
+    assert '"det_path": "kamae/specific"' in raw_json
     assert retrieval_debug["deterministic_short_circuit"] is True
     assert retrieval_debug["llm_routing"]["model_used"] == "deterministic_composer"
     assert retrieval_debug["llm_routing"]["route"] == "deterministic_local"

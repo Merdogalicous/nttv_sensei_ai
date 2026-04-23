@@ -8,8 +8,9 @@ import unicodedata
 
 from nttv_chatbot.deterministic import DeterministicResult, build_result
 
+from .technique_loader import parse_technique_md
 
-EXPECTED_COLS = 12
+
 TECHNIQUE_SOURCE = "Technique Descriptions.md"
 RANK_SOURCE = "nttv rank requirements.txt"
 WEAPONS_SOURCE = "NTTV Weapons Reference.txt"
@@ -70,59 +71,21 @@ def _source_text(passages: List[Dict[str, Any]], source_name: str) -> str:
     return _load_file(source_name)
 
 
-def _split_row_limited(raw: str) -> List[str]:
-    parts = raw.split(",", EXPECTED_COLS - 1)
-    parts = [part.strip() for part in parts]
-    if len(parts) > EXPECTED_COLS:
-        head = parts[: EXPECTED_COLS - 1]
-        tail = ",".join(parts[EXPECTED_COLS - 1 :])
-        parts = head + [tail]
-    if len(parts) < EXPECTED_COLS:
-        parts += [""] * (EXPECTED_COLS - len(parts))
-    return parts
-
-
-def _iter_csv_lines(md_text: str):
-    for raw in (md_text or "").splitlines():
-        stripped = raw.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("#") or stripped.startswith("```"):
-            continue
-        if "," in raw:
-            yield raw
-
-
 def _load_kamae_records(passages: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     text = _source_text(passages, TECHNIQUE_SOURCE)
     out: Dict[str, Dict[str, Any]] = {}
     if not text:
         return out
 
-    for raw in _iter_csv_lines(text):
-        row = _split_row_limited(raw)
-        rec = {
-            "name": row[0],
-            "japanese": row[1],
-            "translation": row[2],
-            "type": row[3],
-            "rank": row[4],
-            "in_rank": row[5],
-            "primary_focus": row[6],
-            "safety": row[7],
-            "partner_required": row[8],
-            "solo": row[9],
-            "tags": row[10],
-            "description": row[11],
-        }
+    for rec in parse_technique_md(text):
         if _fold(rec["type"]) != "kamae":
             continue
 
         name = rec["name"] or ""
         out[_fold(name)] = rec
 
-        if "no Kamae" in name:
-            short = name.replace("no Kamae", "").strip()
+        if name.lower().endswith(" no kamae"):
+            short = name[:-9].strip()
             if short:
                 out[_fold(short)] = rec
 
