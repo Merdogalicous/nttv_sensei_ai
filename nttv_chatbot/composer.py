@@ -221,6 +221,16 @@ def _compose_bullets(
         lines.append(f'- Current soke: {facts.get("soke_name", "")}')
         return "\n".join(lines)
 
+    if answer_type == "lineage_person":
+        lines = [facts.get("person_name", "Lineage figure") + ":"]
+        if facts.get("role_or_relationship"):
+            lines.append(f'- Role: {facts["role_or_relationship"]}')
+        if facts.get("related_person"):
+            lines.append(f'- Related person: {facts["related_person"]}')
+        if facts.get("summary"):
+            lines.append(f'- Summary: {_sentence(facts["summary"])}')
+        return "\n".join(lines)
+
     return _compose_fallback_bullets(result)
 
 
@@ -423,6 +433,19 @@ def _compose_paragraph(
 
     if answer_type == "leadership":
         return f'{facts.get("soke_name", "This person")} is the current soke of {facts.get("school_name", "that school")}.'
+
+    if answer_type == "lineage_person":
+        person_name = facts.get("person_name", "This lineage figure")
+        sentences = []
+        if facts.get("role_or_relationship"):
+            sentences.append(f'{person_name} is described here as {facts["role_or_relationship"]}.')
+        else:
+            sentences.append(f"{person_name} appears in the lineage material.")
+        if facts.get("summary"):
+            sentences.append(_sentence(facts["summary"]))
+        if style != "brief" and facts.get("related_person"):
+            sentences.append(f'Related person: {facts["related_person"]}.')
+        return " ".join(sentences)
 
     return _compose_fallback_paragraph(result)
 

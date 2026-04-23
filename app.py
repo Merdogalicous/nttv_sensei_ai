@@ -46,6 +46,7 @@ except Exception:
 from extractors import try_extract_answer
 from extractors.rank import try_answer_rank_requirements
 from extractors.kamae import try_answer_kamae
+from extractors.lineage_people import try_answer_lineage_person
 from extractors.weapons import try_answer_weapon_rank
 from extractors.schools import (
     try_answer_school_catalog,
@@ -655,6 +656,8 @@ def _resolved_topic_from_result(result: DeterministicResult) -> Optional[str]:
         return facts.get("point_name")
     if result.answer_type == "leadership":
         return facts.get("soke_name") or facts.get("school_name")
+    if result.answer_type == "lineage_person":
+        return facts.get("person_name") or facts.get("related_person")
     if result.answer_type == "sanshin_element":
         return facts.get("element_name")
     if result.answer_type in {"sanshin_list", "sanshin_overview"}:
@@ -1389,6 +1392,14 @@ def _answer_from_passages(
     if kamae_result:
         answer_text, raw, route_debug = _compose_deterministic_result(question, kamae_result, passages)
         return answer_text, passages, raw, route_debug, kamae_result
+
+    try:
+        lineage_person = try_answer_lineage_person(question, passages)
+    except Exception:
+        lineage_person = None
+    if lineage_person:
+        answer_text, raw, route_debug = _compose_deterministic_result(question, lineage_person, passages)
+        return answer_text, passages, raw, route_debug, lineage_person
 
     fact = try_extract_answer(question, passages)
     if fact:
