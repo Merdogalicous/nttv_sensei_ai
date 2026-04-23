@@ -1,32 +1,42 @@
-# extractors/kamae.py
 from __future__ import annotations
-from typing import List, Dict, Any, Optional
-import unicodedata
-import re
+
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+import os
+import re
+import unicodedata
 
-from .common import join_oxford
-
-# ----------------- small helpers -----------------
-
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+from nttv_chatbot.deterministic import DeterministicResult, build_result
 
 
-def _fold(s: str) -> str:
-    if not s:
+EXPECTED_COLS = 12
+TECHNIQUE_SOURCE = "Technique Descriptions.md"
+RANK_SOURCE = "nttv rank requirements.txt"
+WEAPONS_SOURCE = "NTTV Weapons Reference.txt"
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def _fold(text: str) -> str:
+    if not text:
         return ""
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return s.lower()
+    normalized = unicodedata.normalize("NFKD", text)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return normalized.lower()
 
 
 def _looks_like_kamae_question(question: str) -> bool:
     q = _fold(question)
-    # Keep this fairly strict so we don't steal unrelated questions
     return "kamae" in q or "stance" in q or "stances" in q
 
-# ----------------- file loading -----------------
+
+def _same_source_name(p_source: str, target_name: str) -> bool:
+    if not p_source:
+        return False
+    return os.path.basename(p_source).lower() == os.path.basename(target_name).lower()
+
 
 def _data_dir() -> Path:
     here = Path(__file__).resolve()
@@ -34,25 +44,38 @@ def _data_dir() -> Path:
 
 
 def _load_file(name: str) -> str:
-    p = _data_dir() / name
+    path = _data_dir() / name
     try:
-        if p.exists():
-            return p.read_text(encoding="utf-8")
+        if path.exists():
+            return path.read_text(encoding="utf-8")
     except Exception:
         return ""
     return ""
 
-# ----------------- basic kamae (Technique Descriptions.md) -----------------
 
-EXPECTED_COLS = 12  # same schema as techniques.py
+def _join_passages_text(passages: List[Dict[str, Any]], source_name: str) -> str:
+    chunks: list[str] = []
+    for passage in passages:
+        src = passage.get("source") or passage.get("meta", {}).get("source") or ""
+        text = passage.get("text") or ""
+        if text and (_same_source_name(src, source_name) or source_name.lower() in src.lower()):
+            chunks.append(text)
+    return "\n".join(chunks).strip()
+
+
+def _source_text(passages: List[Dict[str, Any]], source_name: str) -> str:
+    from_passages = _join_passages_text(passages, source_name)
+    if from_passages:
+        return from_passages
+    return _load_file(source_name)
 
 
 def _split_row_limited(raw: str) -> List[str]:
     parts = raw.split(",", EXPECTED_COLS - 1)
-    parts = [p.strip() for p in parts]
+    parts = [part.strip() for part in parts]
     if len(parts) > EXPECTED_COLS:
-        head = parts[:EXPECTED_COLS - 1]
-        tail = ",".join(parts[EXPECTED_COLS - 1:])
+        head = parts[: EXPECTED_COLS - 1]
+        tail = ",".join(parts[EXPECTED_COLS - 1 :])
         parts = head + [tail]
     if len(parts) < EXPECTED_COLS:
         parts += [""] * (EXPECTED_COLS - len(parts))
@@ -61,29 +84,23 @@ def _split_row_limited(raw: str) -> List[str]:
 
 def _iter_csv_lines(md_text: str):
     for raw in (md_text or "").splitlines():
-        st = raw.strip()
-        if not st:
+        stripped = raw.strip()
+        if not stripped:
             continue
-        if st.startswith("#") or st.startswith("```"):
+        if stripped.startswith("#") or stripped.startswith("```"):
             continue
         if "," in raw:
             yield raw
 
 
-def _load_kamae_records() -> Dict[str, Dict[str, Any]]:
-    """
-    Load all rows where Type == 'Kamae' from Technique Descriptions.md
-    and index by folded name (with and without 'no Kamae').
-    """
-    text = _load_file("Technique Descriptions.md")
+def _load_kamae_records(passages: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    text = _source_text(passages, TECHNIQUE_SOURCE)
     out: Dict[str, Dict[str, Any]] = {}
     if not text:
         return out
 
     for raw in _iter_csv_lines(text):
         row = _split_row_limited(raw)
-        if len(row) < EXPECTED_COLS:
-            continue
         rec = {
             "name": row[0],
             "japanese": row[1],
@@ -102,10 +119,8 @@ def _load_kamae_records() -> Dict[str, Dict[str, Any]]:
             continue
 
         name = rec["name"] or ""
-        key_full = _fold(name)
-        out[key_full] = rec
+        out[_fold(name)] = rec
 
-        # Also allow shortened form without "no Kamae"
         if "no Kamae" in name:
             short = name.replace("no Kamae", "").strip()
             if short:
@@ -114,29 +129,46 @@ def _load_kamae_records() -> Dict[str, Dict[str, Any]]:
     return out
 
 
-def _format_kamae(rec: Dict[str, Any]) -> str:
-    name = rec.get("name") or "Kamae"
-    translation = rec.get("translation") or ""
-    rank = rec.get("rank") or ""
-    desc = (rec.get("description") or "").strip()
-
-    lines = [f"{name}:"]
-    if translation:
-        lines.append(f"- Translation: {translation}")
-    if rank:
-        lines.append(f"- Rank intro: {rank}")
-    if desc:
-        lines.append(f"- Description: {desc}")
-    else:
-        lines.append("- Description: (not listed).")
-    return "\n".join(lines)
+def _normalize_tags(tags_raw: Any) -> List[str]:
+    if isinstance(tags_raw, str):
+        return [item.strip() for item in re.split(r"[|,]", tags_raw) if item.strip()]
+    if isinstance(tags_raw, list):
+        return [str(item).strip() for item in tags_raw if str(item).strip()]
+    return []
 
 
-def _answer_specific_kamae(question: str) -> Optional[str]:
-    """
-    Handle questions like 'what is Hicho no Kamae' / 'explain shizen no kamae stance'.
-    """
-    records = _load_kamae_records()
+def _build_specific_kamae_result(
+    rec: Dict[str, Any],
+    passages: List[Dict[str, Any]],
+) -> DeterministicResult:
+    return build_result(
+        det_path="kamae/specific",
+        answer_type="technique",
+        facts={
+            "technique_name": rec.get("name"),
+            "japanese": rec.get("japanese"),
+            "translation": rec.get("translation"),
+            "type": rec.get("type"),
+            "rank_context": rec.get("rank"),
+            "primary_focus": rec.get("primary_focus"),
+            "safety": rec.get("safety"),
+            "partner_required": None,
+            "solo": None,
+            "tags": _normalize_tags(rec.get("tags")),
+            "definition": rec.get("description"),
+        },
+        passages=passages,
+        preferred_sources=[TECHNIQUE_SOURCE],
+        confidence=0.95,
+        display_hints={"explain": True},
+    )
+
+
+def _answer_specific_kamae(
+    question: str,
+    passages: List[Dict[str, Any]],
+) -> Optional[DeterministicResult]:
+    records = _load_kamae_records(passages)
     if not records:
         return None
 
@@ -146,52 +178,37 @@ def _answer_specific_kamae(question: str) -> Optional[str]:
             continue
         pattern = r"\b" + re.escape(key) + r"\b"
         if re.search(pattern, q):
-            return _format_kamae(rec)
-
+            return _build_specific_kamae_result(rec, passages)
     return None
 
-# ----------------- rank-based kamae (nttv rank requirements.txt) -----------------
 
-def _load_rank_text() -> str:
-    return _load_file("nttv rank requirements.txt")
+def _load_rank_text(passages: List[Dict[str, Any]]) -> str:
+    return _source_text(passages, RANK_SOURCE)
 
 
-def _extract_rank_kamae(rank_label: str) -> Optional[List[str]]:
-    """
-    Find the 'Kamae:' line for a given rank block, e.g. '9th Kyu'.
-
-    We:
-      - Locate the line that matches the rank label.
-      - Scan forward until the next blank line or next 'Kyu' header.
-      - Within that window, pick the first line that starts with 'Kamae:' (not 'Weapon Kamae:').
-    """
-    text = _load_rank_text()
+def _extract_rank_kamae(rank_label: str, passages: List[Dict[str, Any]]) -> Optional[List[str]]:
+    text = _load_rank_text(passages)
     if not text:
         return None
 
     lines = text.splitlines()
-    # Find the rank header line index
     start_idx = None
     target = _fold(rank_label)
-    for i, raw in enumerate(lines):
+    for idx, raw in enumerate(lines):
         if _fold(raw.strip()) == target:
-            start_idx = i
+            start_idx = idx
             break
 
     if start_idx is None:
         return None
 
-    # Scan forward for the first "Kamae:" line in this rank block
     kamae_line: Optional[str] = None
-    for raw in lines[start_idx + 1:]:
+    for raw in lines[start_idx + 1 :]:
         stripped = raw.strip()
         if not stripped:
-            # end of this rank block
             break
-        # next rank header?
         if re.search(r"\b(\d+)(st|nd|rd|th)\s+kyu\b", _fold(stripped)):
             break
-        # Must start with 'Kamae:' exactly, not 'Weapon Kamae:'
         if stripped.startswith("Kamae:"):
             kamae_line = stripped
             break
@@ -199,51 +216,47 @@ def _extract_rank_kamae(rank_label: str) -> Optional[List[str]]:
     if kamae_line is None:
         return None
 
-    # Take everything after "Kamae:"
     after = kamae_line.split(":", 1)[1].strip()
     if not after:
         return []
-    parts = [p.strip() for p in after.split(";") if p.strip()]
-    return parts
+    return [part.strip() for part in after.split(";") if part.strip()]
 
 
-def _answer_rank_kamae(question: str) -> Optional[str]:
-    """
-    Handle questions like 'what are the kamae for 9th kyu?'
-    """
+def _answer_rank_kamae(
+    question: str,
+    passages: List[Dict[str, Any]],
+) -> Optional[DeterministicResult]:
     q = _fold(question)
-    m = re.search(r"(\d+)(st|nd|rd|th)\s+kyu", q)
-    if not m:
+    match = re.search(r"(\d+)(st|nd|rd|th)\s+kyu", q)
+    if not match:
         return None
 
-    num = m.group(1)
-    suffix = m.group(2)
-    label = f"{num}{suffix} Kyu"  # 9th Kyu, 8th Kyu, 1st Kyu, etc.
-
-    kamae_list = _extract_rank_kamae(label)
+    label = f"{match.group(1)}{match.group(2)} Kyu"
+    kamae_list = _extract_rank_kamae(label, passages)
     if kamae_list is None:
         return None
-    if not kamae_list:
-        return f"No specific kamae are listed for {label}."
 
-    joined = join_oxford(kamae_list)
-    return f"Kamae for {label}: {joined}"
+    return build_result(
+        det_path="rank/kamae",
+        answer_type="rank_kamae",
+        facts={
+            "rank": label,
+            "items": kamae_list,
+            "category_label": "kamae",
+        },
+        passages=passages,
+        preferred_sources=[RANK_SOURCE],
+        confidence=0.97,
+        display_hints={"explain": True},
+    )
 
-# ----------------- weapon kamae (NTTV Weapons Reference.txt) -----------------
 
-def _load_weapons_text() -> str:
-    return _load_file("NTTV Weapons Reference.txt")
-
-
-def _build_weapon_kamae_index() -> Dict[str, List[str]]:
-    """
-    Build alias -> [kamae, ...] mapping from NTTV Weapons Reference.txt.
-    """
-    text = _load_weapons_text()
+def _build_weapon_kamae_index(passages: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    text = _source_text(passages, WEAPONS_SOURCE)
     if not text:
         return {}
 
-    index: Dict[str, List[str]] = {}
+    index: Dict[str, Dict[str, Any]] = {}
     current_weapon: Optional[str] = None
     current_aliases: List[str] = []
 
@@ -253,35 +266,32 @@ def _build_weapon_kamae_index() -> Dict[str, List[str]]:
             continue
 
         if line.startswith("[WEAPON]"):
-            name = line[len("[WEAPON]"):].strip()
-            current_weapon = name
-            current_aliases = [name]
-
+            current_weapon = line[len("[WEAPON]") :].strip()
+            current_aliases = [current_weapon]
         elif line.upper().startswith("ALIASES:"):
             alias_str = line.split(":", 1)[1]
-            aliases = [a.strip() for a in alias_str.split(",") if a.strip()]
+            aliases = [alias.strip() for alias in alias_str.split(",") if alias.strip()]
             current_aliases.extend(aliases)
-
         elif line.upper().startswith("KAMAE:"):
             if not current_weapon:
                 continue
             kamae_str = line.split(":", 1)[1]
-            kamae = [k.strip() for k in kamae_str.split(",") if k.strip()]
-
-            for al in current_aliases:
-                index[_fold(al)] = kamae
+            kamae = [item.strip() for item in kamae_str.split(",") if item.strip()]
+            payload = {
+                "weapon_name": current_weapon,
+                "kamae": kamae,
+            }
+            for alias in current_aliases:
+                index[_fold(alias)] = payload
 
     return index
 
 
-def _answer_weapon_kamae(question: str) -> Optional[str]:
-    """
-    Handle questions like:
-      - 'What kamae do we use with the hanbo?'
-      - 'Hanbo kamae'
-      - 'weapon kamae for rokushakubo'
-    """
-    idx = _build_weapon_kamae_index()
+def _answer_weapon_kamae(
+    question: str,
+    passages: List[Dict[str, Any]],
+) -> Optional[DeterministicResult]:
+    idx = _build_weapon_kamae_index(passages)
     if not idx:
         return None
 
@@ -295,36 +305,41 @@ def _answer_weapon_kamae(question: str) -> Optional[str]:
     if not best_alias:
         return None
 
-    kamae = idx[best_alias]
-    display_weapon = best_alias.title()
-    joined = join_oxford(kamae)
-    return f"{display_weapon} kamae: {joined}"
+    payload = idx[best_alias]
+    return build_result(
+        det_path="weapons/kamae",
+        answer_type="weapon_profile",
+        facts={
+            "weapon_name": payload["weapon_name"],
+            "weapon_type": "",
+            "kamae": list(payload["kamae"]),
+            "core_actions": [],
+            "rank_context": "",
+            "notes": "",
+        },
+        passages=passages,
+        preferred_sources=[WEAPONS_SOURCE],
+        confidence=0.95,
+        display_hints={"explain": True},
+    )
 
-# ----------------- public entrypoint -----------------
 
-def try_answer_kamae(question: str, passages: List[Dict[str, Any]]) -> Optional[str]:
-    """
-    Deterministic Kamae extractor:
-
-      * Rank-based lists: 'kamae for 9th kyu'
-      * Weapon kamae: 'hanbo kamae', 'kamae with the rokushakubo'
-      * Specific kamae definitions: 'what is Hicho no Kamae'
-    """
+def try_answer_kamae(
+    question: str,
+    passages: List[Dict[str, Any]],
+) -> Optional[DeterministicResult]:
     if not _looks_like_kamae_question(question):
         return None
 
-    # 1) Rank-specific kamae (e.g., "kamae for 9th kyu")
-    ans = _answer_rank_kamae(question)
+    ans = _answer_rank_kamae(question, passages)
     if ans:
         return ans
 
-    # 2) Weapon kamae (e.g., "Hanbo kamae")
-    ans = _answer_weapon_kamae(question)
+    ans = _answer_weapon_kamae(question, passages)
     if ans:
         return ans
 
-    # 3) Individual kamae definitions (e.g., "what is Hicho no Kamae")
-    ans = _answer_specific_kamae(question)
+    ans = _answer_specific_kamae(question, passages)
     if ans:
         return ans
 

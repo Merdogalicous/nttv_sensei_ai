@@ -45,6 +45,7 @@ except Exception:
 # Deterministic extractors (dispatcher + specific modules)
 from extractors import try_extract_answer
 from extractors.rank import try_answer_rank_requirements
+from extractors.kamae import try_answer_kamae
 from extractors.weapons import try_answer_weapon_rank
 from extractors.schools import (
     try_answer_school_catalog,
@@ -1380,6 +1381,14 @@ def _answer_from_passages(
             passages,
         )
         return answer_text, passages, raw, route_debug, rank_requirements
+
+    try:
+        kamae_result = try_answer_kamae(question, passages)
+    except Exception:
+        kamae_result = None
+    if kamae_result:
+        answer_text, raw, route_debug = _compose_deterministic_result(question, kamae_result, passages)
+        return answer_text, passages, raw, route_debug, kamae_result
 
     fact = try_extract_answer(question, passages)
     if fact:
