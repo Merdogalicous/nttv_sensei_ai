@@ -5,10 +5,24 @@ import os
 import re
 import unicodedata
 
-from nttv_chatbot.deterministic import DeterministicResult, build_result
+from nttv_chatbot.deterministic import DeterministicResult, SourceRef, build_result
+
+from .leadership import LEADERSHIP_SOURCE, extract_current_soke_map
 
 
 AUTHORITATIVE_SCHOOL_PROFILE_SOURCE = "Schools of the Bujinkan Summaries.txt"
+
+CANONICAL_SCHOOL_ORDER = [
+    "Togakure Ryu",
+    "Gyokushin Ryu",
+    "Kumogakure Ryu",
+    "Gikan Ryu",
+    "Gyokko Ryu",
+    "Koto Ryu",
+    "Shinden Fudo Ryu",
+    "Kukishinden Ryu",
+    "Takagi Yoshin Ryu",
+]
 
 
 SCHOOL_ALIASES: Dict[str, List[str]] = {
@@ -23,11 +37,13 @@ SCHOOL_ALIASES: Dict[str, List[str]] = {
         "gyokko ryu",
         "gyokko-ryu",
         "gyokko",
+        "gyokko ryu kosshijutsu",
     ],
     "Koto Ryu": [
         "koto ryu",
         "koto-ryu",
         "koto",
+        "koto ryu koppojutsu",
     ],
     "Shinden Fudo Ryu": [
         "shinden fudo ryu",
@@ -109,7 +125,22 @@ SCHOOL_CANONICAL_FACTS: Dict[str, Dict[str, str]] = {
 
 
 _PROFILE_FIELD_KEYS = ("translation", "type", "focus", "weapons", "notes")
-_INTEGRITY_FIELD_KEYS = ("aliases",) + _PROFILE_FIELD_KEYS
+_INTEGRITY_FIELD_KEYS = ("aliases", "key points") + _PROFILE_FIELD_KEYS
+_CATALOG_DETAIL_TOKENS = (
+    "overview",
+    "describe",
+    "tell me about",
+    "including",
+    "include",
+    "translation",
+    "english translation",
+    "current soke",
+    "soke",
+    "style",
+    "type",
+    "brief description",
+    "description",
+)
 
 
 def _norm(value: str) -> str:
@@ -188,8 +219,30 @@ def _canon_for_query(question: str) -> Optional[str]:
     return None
 
 
+def _is_school_group_query(question: str) -> bool:
+    normalized = _norm(question)
+    if "schools of the bujinkan" in normalized:
+        return True
+    if "bujinkan" in normalized and ("school" in normalized or "schools" in normalized):
+        return True
+    if "nine schools of the bujinkan" in normalized:
+        return True
+    if "nine schools" in normalized and "bujinkan" in normalized:
+        return True
+    return False
+
+
+def is_school_catalog_query(question: str) -> bool:
+    normalized = _norm(question)
+    if not _is_school_group_query(question):
+        return False
+    return any(token in normalized for token in _CATALOG_DETAIL_TOKENS)
+
+
 def is_school_list_query(question: str) -> bool:
     normalized = _norm(question)
+    if is_school_catalog_query(question):
+        return False
     triggers = [
         "what are the schools of the bujinkan",
         "list the schools of the bujinkan",
@@ -199,7 +252,9 @@ def is_school_list_query(question: str) -> bool:
         "what schools are in the bujinkan",
         "which schools are in the bujinkan",
     ]
-    return any(trigger in normalized for trigger in triggers)
+    if any(trigger in normalized for trigger in triggers):
+        return True
+    return _is_school_group_query(question) and "list" in normalized
 
 
 def _extract_school_block(lines: List[str], start_index: int) -> List[str]:
@@ -317,8 +372,8 @@ def _fallback_block_by_alias(blob: str, canon: str) -> Optional[List[str]]:
     allowed_tokens = set(_school_tokens(canon))
     lines = blob.splitlines()
     for idx, line in enumerate(lines):
-        line_token = _norm(line).strip(" :")
-        if line_token not in allowed_tokens:
+        token = _norm(line).strip(" :")
+        if token not in allowed_tokens:
             continue
         block = _extract_school_block(lines, idx)
         if block and _block_integrity_ok(canon, block[0], block[1:]):
@@ -376,6 +431,25 @@ def _finalize_school_fields(canon: str, fields: Dict[str, str]) -> Optional[Dict
     return cleaned
 
 
+def _extract_brief_description(body: List[str], fields: Dict[str, str]) -> Optional[str]:
+    collecting_key_points = False
+    for line in body:
+        token = _norm(line)
+        if token == "key points:":
+            collecting_key_points = True
+            continue
+        if collecting_key_points:
+            if _structured_field_key(line) is not None:
+                break
+            stripped = line.strip()
+            if stripped.startswith(("-", "*")):
+                return stripped.lstrip("-* ").strip()
+            if stripped:
+                return stripped
+
+    return fields.get("focus") or fields.get("notes")
+
+
 def _extract_fields_from_school_block(
     canon: str,
     header: str,
@@ -392,8 +466,78 @@ def _extract_fields_from_school_block(
     return _finalize_school_fields(canon, inferred)
 
 
-def _canon_from_header(header_line: str) -> Optional[str]:
-    return _school_header_canon(header_line)
+def _summary_fields_by_school(passages: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    blob = _collect_schools_blob(passages)
+    if not blob.strip():
+        return {}
+
+    summaries: Dict[str, Dict[str, str]] = {}
+    for header, body in _slice_school_blocks(blob):
+        canon = _school_header_canon(header)
+        if not canon or canon in summaries:
+            continue
+        fields = _extract_fields_from_school_block(canon, header, body)
+        if not fields:
+            continue
+        summary = dict(fields)
+        brief_description = _extract_brief_description(body, summary)
+        if brief_description:
+            summary["brief_description"] = brief_description
+        summaries[canon] = summary
+    return summaries
+
+
+def _catalog_source_refs() -> List[SourceRef]:
+    return [
+        SourceRef(source=AUTHORITATIVE_SCHOOL_PROFILE_SOURCE),
+        SourceRef(source=LEADERSHIP_SOURCE),
+    ]
+
+
+def try_answer_school_catalog(
+    question: str,
+    passages: List[Dict[str, Any]],
+    *,
+    bullets: bool = True,
+) -> Optional[DeterministicResult]:
+    if not is_school_catalog_query(question):
+        return None
+
+    summaries = _summary_fields_by_school(passages)
+    if not summaries:
+        return None
+
+    soke_map = extract_current_soke_map(passages)
+    schools: List[Dict[str, str]] = []
+    for canon in CANONICAL_SCHOOL_ORDER:
+        fields = dict(summaries.get(canon) or {})
+        finalized = _finalize_school_fields(canon, fields) or {}
+
+        school_entry: Dict[str, str] = {"school_name": canon}
+        for key in ("translation", "type"):
+            if finalized.get(key):
+                school_entry[key] = finalized[key]
+        current_soke = soke_map.get(canon)
+        if current_soke:
+            school_entry["current_soke"] = current_soke
+        brief_description = fields.get("brief_description")
+        if brief_description:
+            school_entry["brief_description"] = brief_description
+
+        schools.append(school_entry)
+
+    return build_result(
+        det_path="schools/catalog",
+        answer_type="school_catalog",
+        facts={
+            "list_title": "The Nine Schools of the Bujinkan",
+            "schools": schools,
+        },
+        source_refs=_catalog_source_refs(),
+        confidence=0.97,
+        display_hints={"explain": True},
+        followup_suggestions=["Ask about one school if you want a more detailed profile."],
+    )
 
 
 def try_answer_schools_list(
@@ -405,39 +549,13 @@ def try_answer_schools_list(
     if not is_school_list_query(question):
         return None
 
-    blob = _collect_schools_blob(passages)
-    if not blob.strip():
+    summaries = _summary_fields_by_school(passages)
+    if not summaries:
         return None
 
-    blocks = _slice_school_blocks(blob)
-    if not blocks:
-        return None
-
-    names: List[str] = []
-    seen = set()
-    for header, _ in blocks:
-        canon = _canon_from_header(header)
-        if canon and canon not in seen:
-            seen.add(canon)
-            names.append(canon)
-
+    names = [canon for canon in CANONICAL_SCHOOL_ORDER if canon in summaries]
     if not names:
         return None
-
-    canonical_order = [
-        "Togakure Ryu",
-        "Gyokushin Ryu",
-        "Kumogakure Ryu",
-        "Gikan Ryu",
-        "Gyokko Ryu",
-        "Koto Ryu",
-        "Shinden Fudo Ryu",
-        "Kukishinden Ryu",
-        "Takagi Yoshin Ryu",
-    ]
-    if set(name.lower() for name in names) >= set(name.lower() for name in canonical_order):
-        order_map = {name.lower(): idx for idx, name in enumerate(canonical_order)}
-        names.sort(key=lambda name: order_map.get(name.lower(), 999))
 
     return build_result(
         det_path="schools/list",
@@ -474,22 +592,19 @@ def try_answer_school_profile(
     if not canon:
         return None
 
-    blob = _collect_schools_blob(passages)
-    if not blob.strip():
-        return None
-
-    fields: Optional[Dict[str, str]] = None
-    for header, body in _slice_school_blocks(blob):
-        if not _header_matches(header, canon):
-            continue
-        fields = _extract_fields_from_school_block(canon, header, body)
-        if fields:
-            break
+    summaries = _summary_fields_by_school(passages)
+    fields = summaries.get(canon)
 
     if not fields:
+        blob = _collect_schools_blob(passages)
         window = _fallback_block_by_alias(blob, canon)
         if window:
-            fields = _extract_fields_from_school_block(canon, window[0], window[1:])
+            fallback_fields = _extract_fields_from_school_block(canon, window[0], window[1:])
+            if fallback_fields:
+                fields = dict(fallback_fields)
+                brief_description = _extract_brief_description(window[1:], fields)
+                if brief_description:
+                    fields["brief_description"] = brief_description
 
     if not fields:
         return None

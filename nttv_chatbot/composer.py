@@ -105,6 +105,15 @@ def _compose_bullets(
             lines.append(f"- {item}")
         return "\n".join(lines)
 
+    if answer_type == "school_catalog":
+        lines = [facts.get("list_title", "The Nine Schools of the Bujinkan:")]
+        for school in facts.get("schools", []):
+            lines.extend(_compose_school_catalog_bullets(school, style=style))
+            lines.append("")
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "\n".join(lines)
+
     if answer_type == "weapon_profile":
         lines = [f'{facts.get("weapon_name", "Weapon")} weapon profile:']
         for key, label in [
@@ -291,6 +300,13 @@ def _compose_paragraph(
             return f'{title}: {", ".join(names)}.'
         return f'{title} are {_join_human(names)}.'
 
+    if answer_type == "school_catalog":
+        title = facts.get("list_title", "The Nine Schools of the Bujinkan")
+        blocks = [title + ":"]
+        for school in facts.get("schools", []):
+            blocks.append(_compose_school_catalog_paragraph(school, style=style))
+        return "\n\n".join(block for block in blocks if block.strip())
+
     if answer_type == "weapon_profile":
         weapon_name = facts.get("weapon_name", "This weapon")
         sentences = []
@@ -446,6 +462,41 @@ def _compose_fallback_bullets(result: DeterministicResult) -> str:
 def _compose_fallback_paragraph(result: DeterministicResult) -> str:
     fragments = [f"{_labelize(key)} = {_comparison_value(value)}" for key, value in result.facts.items()]
     return f'{result.answer_type.replace("_", " ").title()}: ' + "; ".join(fragments) + "."
+
+
+def _compose_school_catalog_bullets(school: dict[str, Any], *, style: str) -> list[str]:
+    lines = [f'- {school.get("school_name", "School")}']
+    field_order = [
+        ("translation", "Translation"),
+        ("type", "Type/style"),
+        ("current_soke", "Current soke"),
+        ("brief_description", "Brief"),
+    ]
+    if style == "brief":
+        field_order = [
+            ("translation", "Translation"),
+            ("current_soke", "Current soke"),
+            ("brief_description", "Brief"),
+        ]
+    for key, label in field_order:
+        value = school.get(key)
+        if value:
+            lines.append(f"  {label}: {value}")
+    return lines
+
+
+def _compose_school_catalog_paragraph(school: dict[str, Any], *, style: str) -> str:
+    name = school.get("school_name", "School")
+    sentences = [name + "."]
+    if school.get("translation"):
+        sentences.append(f'Translation: "{school["translation"]}".')
+    if style != "brief" and school.get("type"):
+        sentences.append(f'Type/style: {school["type"]}.')
+    if school.get("current_soke"):
+        sentences.append(f'Current soke: {school["current_soke"]}.')
+    if school.get("brief_description"):
+        sentences.append(_sentence(str(school["brief_description"])))
+    return " ".join(sentences)
 
 
 def _normalize_style(style: str) -> str:

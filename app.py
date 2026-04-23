@@ -47,9 +47,11 @@ from extractors import try_extract_answer
 from extractors.rank import try_answer_rank_requirements
 from extractors.weapons import try_answer_weapon_rank
 from extractors.schools import (
+    try_answer_school_catalog,
     try_answer_school_profile,
     try_answer_schools_list,   # list extractor
     SCHOOL_ALIASES,
+    is_school_catalog_query,
     is_school_list_query,
 )
 
@@ -642,7 +644,7 @@ def _resolved_topic_from_result(result: DeterministicResult) -> Optional[str]:
         if left_name and right_name:
             return f"{left_name} and {right_name}"
         return left_name or right_name or None
-    if result.answer_type in {"school_profile", "school_list"}:
+    if result.answer_type in {"school_profile", "school_list", "school_catalog"}:
         return facts.get("school_name") or facts.get("list_title")
     if result.answer_type in {"weapon_profile", "weapon_rank", "weapon_parts", "weapon_classification"}:
         return facts.get("weapon_name") or facts.get("title")
@@ -1325,6 +1327,17 @@ def _answer_from_passages(
     if fast:
         answer_text, raw, route_debug = _compose_deterministic_result(question, fast, passages)
         return answer_text, passages, raw, route_debug, fast
+
+    if is_school_catalog_query(question):
+        try:
+            catalog_ans = try_answer_school_catalog(
+                question, passages, bullets=(output_style == "Bullets")
+            )
+        except Exception:
+            catalog_ans = None
+        if catalog_ans:
+            answer_text, raw, route_debug = _compose_deterministic_result(question, catalog_ans, passages)
+            return answer_text, passages, raw, route_debug, catalog_ans
 
     if is_school_list_query(question):
         try:
