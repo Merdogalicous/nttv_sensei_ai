@@ -3,8 +3,12 @@
   "embed_model": "sentence-transformers/all-MiniLM-L6-v2",
   "faiss_path": "C:\\Users\\paulz\\GitHub\\nttv_chatbot_ext\\index\\index.faiss",
   "top_k": 6,
-  "chunk_size": 700,
-  "chunk_overlap": 120,
+  "chunk_size": 960,
+  "chunk_overlap": 160,
+  "chunk_target_tokens": 180,
+  "chunk_max_tokens": 240,
+  "chunk_overlap_tokens": 40,
+  "chunk_min_tokens": 60,
   "files": [
     "data\\Bujinkan Leadership and Wisdom.txt",
     "data\\Glossary - edit.txt",
@@ -18,6 +22,20 @@
     "data\\Technique Descriptions.md",
     "data\\What is Buyu.txt"
   ],
-  "num_chunks": 373,
-  "faiss_ntotal": 373
+  "skipped_files": [],
+  "parsing": {
+    "enable_pdf_ingest": false,
+    "pdf_parser": "docling",
+    "pdf_parse_max_pages": null,
+    "pdf_fail_open": true
+  },
+  "chunking": {
+    "strategy": "section-aware",
+    "target_tokens": 180,
+    "max_tokens": 240,
+    "overlap_tokens": 40,
+    "min_tokens": 60
+  },
+  "num_chunks": 370,
+  "faiss_ntotal": 370
 }

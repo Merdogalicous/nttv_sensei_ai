@@ -30,3 +30,8 @@ def test_variants_collapse_hyphen_space_for_omote_gyaku():
 def test_canonical_from_english_alias_ogre_crusher():
     canon = canonical_from_query("Can you explain ogre crusher in the Bujinkan?")
     assert canon == "Oni Kudaki"
+
+
+def test_canonical_from_direct_name_oni_kudaki():
+    canon = canonical_from_query("Describe Oni Kudaki")
+    assert canon == "Oni Kudaki"

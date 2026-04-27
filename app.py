@@ -2,6 +2,7 @@
 import os
 import json
 import pickle
+from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
 import re
 import unicodedata
@@ -10,6 +11,23 @@ import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
 load_dotenv()
+
+from nttv_chatbot.composer import compose_deterministic_answer
+from nttv_chatbot.deterministic import DeterministicResult, SourceRef, build_result
+from nttv_chatbot.retrieval import (
+    LexicalRetriever,
+    RetrievalResult,
+    RetrievalSettings,
+    assemble_context as assemble_retrieval_context,
+    search as search_retrieval_pipeline,
+)
+from nttv_chatbot.llm_routing import (
+    LLMRoutingSettings,
+    empty_route_debug,
+    filter_supporting_chunks,
+    generate_grounded_answer,
+    select_generation_route,
+)
 
 
 # Vector index
@@ -25,21 +43,22 @@ except Exception:
     SentenceTransformer = None
 
 # Deterministic extractors (dispatcher + specific modules)
-from extractors.kihon_happo import try_answer_kihon_happo
 from extractors import try_extract_answer
-from extractors.leadership import try_extract_answer as try_leadership
-from extractors.weapons import try_answer_weapon_rank
 from extractors.rank import try_answer_rank_requirements
+from extractors.kamae import try_answer_kamae
+from extractors.lineage_people import try_answer_lineage_person
+from extractors.weapons import try_answer_weapon_rank
 from extractors.schools import (
+    try_answer_school_catalog,
     try_answer_school_profile,
     try_answer_schools_list,   # list extractor
     SCHOOL_ALIASES,
+    is_school_catalog_query,
     is_school_list_query,
 )
 
 from extractors.technique_match import (
-    is_single_technique_query as _is_single_technique_query,
-    technique_name_variants as _tech_name_variants,
+    canonical_from_query as _canonical_technique_from_query,
 )
 
 # --------------------------------------------------------------------
@@ -52,6 +71,7 @@ EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 TOP_K = 6
 CHUNKS: List[Dict[str, Any]] = []
 INDEX = None
+
 
 @st.cache_resource(show_spinner=False)
 def _load_index_and_meta() -> Tuple[Any, List[Dict[str, Any]]]:
@@ -99,7 +119,8 @@ def _load_index_and_meta() -> Tuple[Any, List[Dict[str, Any]]]:
     # TOP_K is optional; default remains 6
     TOP_K_CFG = int(cfg.get("top_k", TOP_K))
 
-    if faiss is None:
+    faiss_module = faiss
+    if faiss_module is None:
         raise RuntimeError(
             "faiss is not installed.\n"
             "Make sure `faiss-cpu==1.13.0` is present in requirements.txt and installed."
@@ -130,7 +151,7 @@ def _load_index_and_meta() -> Tuple[Any, List[Dict[str, Any]]]:
         tried.append(fpath)
         if not (fpath and os.path.exists(fpath)):
             return None
-        idx_local = faiss.read_index(fpath)
+        idx_local = faiss_module.read_index(fpath)
         with open(meta_path, "rb") as f:
             chunks_local: List[Dict[str, Any]] = pickle.load(f)
         # If obviously mismatched, signal caller to try next candidate
@@ -379,6 +400,15 @@ def retrieve(q: str, k: int | None = None) -> List[Dict[str, Any]]:
                     "meta": meta,
                     "source": meta.get("source"),
                     "page": meta.get("page"),
+                    "page_start": meta.get("page_start", meta.get("page")),
+                    "page_end": meta.get("page_end", meta.get("page")),
+                    "heading_path": meta.get("heading_path") or [],
+                    "priority_bucket": meta.get("priority_bucket"),
+                    "chunk_id": meta.get("chunk_id"),
+                    "rank_tag": meta.get("rank_tag"),
+                    "school_tag": meta.get("school_tag"),
+                    "weapon_tag": meta.get("weapon_tag"),
+                    "technique_tag": meta.get("technique_tag"),
                     "score": float(score),
                     "rerank_score": float(new_score),
                 },
@@ -403,8 +433,12 @@ def build_context(snippets: List[Dict[str, Any]], max_chars: int = 6000) -> str:
     lines, total = [], 0
     for i, s in enumerate(snippets, 1):
         tag = f"[{i}] {os.path.basename(s['source'])}"
-        if s.get("page"):
-            tag += f" (p. {s['page']})"
+        page_start = s.get("page_start") or s.get("page")
+        page_end = s.get("page_end") or page_start
+        if page_start and page_end and page_start != page_end:
+            tag += f" (pp. {page_start}-{page_end})"
+        elif page_start:
+            tag += f" (p. {page_start})"
         block = f"{tag}\n{s['text']}\n\n---\n"
         if total + len(block) > max_chars:
             break
@@ -416,6 +450,383 @@ def retrieval_quality(hits: List[Dict[str, Any]]) -> float:
     if not hits:
         return 0.0
     return max(h.get("rerank_score", h.get("score", 0.0)) for h in hits)
+
+
+# Hybrid retrieval overrides the legacy local-only retrieval helpers above.
+_LEXICAL_RETRIEVER: Optional[LexicalRetriever] = None
+_LAST_RETRIEVAL_RESULT: Optional[RetrievalResult] = None
+
+
+def get_lexical_retriever() -> LexicalRetriever:
+    global _LEXICAL_RETRIEVER
+    if _LEXICAL_RETRIEVER is None:
+        _, chunks = _load_index_and_meta()
+        _LEXICAL_RETRIEVER = LexicalRetriever(chunks)
+    return _LEXICAL_RETRIEVER
+
+
+def _legacy_retrieve(q: str, k: int | None = None) -> List[Dict[str, Any]]:
+    global _LAST_RETRIEVAL_RESULT
+
+    idx, chunks = _load_index_and_meta()
+    settings = RetrievalSettings.from_env()
+    final_top_k = k if k is not None else TOP_K
+
+    _LAST_RETRIEVAL_RESULT = search_retrieval_pipeline(
+        q,
+        index=idx,
+        chunks=chunks,
+        embed_query=embed_query,
+        final_top_k=final_top_k,
+        settings=settings,
+        lexical_retriever=get_lexical_retriever(),
+    )
+    return _LAST_RETRIEVAL_RESULT.final_candidates
+
+
+def get_last_retrieval_debug() -> Dict[str, Any]:
+    if _LAST_RETRIEVAL_RESULT is None:
+        return _empty_retrieval_debug("Retrieval was not run for this answer.")
+    return _LAST_RETRIEVAL_RESULT.to_debug_payload()
+
+
+def _legacy_build_context(snippets: List[Dict[str, Any]], max_chars: int = 6000) -> str:
+    return assemble_retrieval_context(snippets, max_chars=max_chars)
+
+
+def _legacy_retrieval_quality(hits: List[Dict[str, Any]]) -> float:
+    if not hits:
+        return 0.0
+    return max(
+        h.get("final_score")
+        or h.get("rerank_score")
+        or h.get("heuristic_score")
+        or h.get("score")
+        or 0.0
+        for h in hits
+    )
+
+
+retrieve = _legacy_retrieve
+build_context = _legacy_build_context
+retrieval_quality = _legacy_retrieval_quality
+
+
+def _empty_retrieval_debug(reason: str) -> Dict[str, Any]:
+    return {
+        "dense_candidates": [],
+        "lexical_candidates": [],
+        "fused_candidates": [],
+        "reranked_candidates": [],
+        "final_candidates": [],
+        "reranker_backend_requested": "none",
+        "reranker_backend_used": "none",
+        "reranker_fallback_reason": reason,
+        "deterministic_short_circuit": True,
+        "llm_routing": empty_route_debug(reason),
+    }
+
+
+def _with_llm_routing_debug(
+    payload: Dict[str, Any],
+    llm_debug: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    merged = dict(payload)
+    merged["llm_routing"] = llm_debug or empty_route_debug("No answer routing details were recorded.")
+    return merged
+
+
+def _format_page_range(meta: Dict[str, Any]) -> str:
+    page_start = meta.get("page_start") or meta.get("page")
+    page_end = meta.get("page_end") or page_start
+    if page_start and page_end and page_start != page_end:
+        return f"{page_start}-{page_end}"
+    if page_start:
+        return str(page_start)
+    return ""
+
+
+def _format_detected_tags(meta: Dict[str, Any]) -> str:
+    labels = [
+        ("rank", meta.get("rank_tag")),
+        ("school", meta.get("school_tag")),
+        ("weapon", meta.get("weapon_tag")),
+        ("technique", meta.get("technique_tag")),
+    ]
+    parts = [f"{name}: {value}" for name, value in labels if value]
+    return ", ".join(parts)
+
+
+_SESSION_FOLLOWUP_STATE_KEY = "last_answer_state"
+_VAGUE_FOLLOWUP_PHRASES = {
+    "unpack one part further",
+    "go deeper",
+    "say more",
+    "expand on that",
+    "tell me more",
+    "can you explain that more",
+    "break that down",
+}
+_FOLLOWUP_CLARIFICATION = "I can do that, but I need to know what you want me to unpack further."
+_EMPTY_GROUNDED_ANSWER = (
+    "I couldn't produce a grounded answer from the available material. "
+    "Please name the topic more directly."
+)
+
+
+@dataclass(frozen=True)
+class FollowupResolution:
+    original_question: str
+    effective_question: str
+    is_vague_followup: bool = False
+    used_prior_topic: bool = False
+    resolved_topic: Optional[str] = None
+    clarification_text: Optional[str] = None
+    cached_result: Optional[DeterministicResult] = None
+
+    @property
+    def needs_clarification(self) -> bool:
+        return bool(self.clarification_text)
+
+
+def _normalize_followup_prompt(question: str) -> str:
+    normalized = re.sub(r"[^a-z0-9\s]", " ", (question or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized.startswith("please "):
+        normalized = normalized[7:].strip()
+    if normalized.endswith(" please"):
+        normalized = normalized[:-7].strip()
+    return normalized
+
+
+def is_vague_followup_prompt(question: str) -> bool:
+    return _normalize_followup_prompt(question) in _VAGUE_FOLLOWUP_PHRASES
+
+
+def _get_followup_state(
+    session_state: Any | None,
+) -> Dict[str, Any]:
+    if session_state is None:
+        return {}
+    raw = session_state.get(_SESSION_FOLLOWUP_STATE_KEY)
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _serialize_source_refs(source_refs: list[SourceRef]) -> list[dict[str, Any]]:
+    return [ref.to_dict() for ref in source_refs]
+
+
+def _restore_source_refs(raw_refs: Any) -> list[SourceRef]:
+    refs: list[SourceRef] = []
+    for raw_ref in raw_refs or []:
+        if isinstance(raw_ref, SourceRef):
+            refs.append(raw_ref)
+            continue
+        if not isinstance(raw_ref, dict):
+            continue
+        refs.append(
+            SourceRef(
+                source=str(raw_ref.get("source") or ""),
+                page_start=raw_ref.get("page_start"),
+                page_end=raw_ref.get("page_end"),
+                heading_path=list(raw_ref.get("heading_path") or []),
+                chunk_id=raw_ref.get("chunk_id"),
+            )
+        )
+    return refs
+
+
+def _resolved_topic_from_result(result: DeterministicResult) -> Optional[str]:
+    facts = result.facts
+    if result.answer_type == "technique":
+        return facts.get("technique_name")
+    if result.answer_type == "technique_diff":
+        left_name = ((facts.get("left") or {}).get("technique_name") or "").strip()
+        right_name = ((facts.get("right") or {}).get("technique_name") or "").strip()
+        if left_name and right_name:
+            return f"{left_name} and {right_name}"
+        return left_name or right_name or None
+    if result.answer_type in {"school_profile", "school_list", "school_catalog"}:
+        return facts.get("school_name") or facts.get("list_title")
+    if result.answer_type in {"weapon_profile", "weapon_rank", "weapon_parts", "weapon_classification"}:
+        return facts.get("weapon_name") or facts.get("title")
+    if result.answer_type == "glossary_term":
+        return facts.get("term")
+    if result.answer_type == "kyusho_point":
+        return facts.get("point_name")
+    if result.answer_type == "leadership":
+        return facts.get("soke_name") or facts.get("school_name")
+    if result.answer_type == "lineage_person":
+        return facts.get("person_name") or facts.get("related_person")
+    if result.answer_type == "sanshin_element":
+        return facts.get("element_name")
+    if result.answer_type in {"sanshin_list", "sanshin_overview"}:
+        return facts.get("title") or "Sanshin no Kata"
+    if result.answer_type == "kihon_happo":
+        return "Kihon Happo"
+    if result.answer_type.startswith("rank_") or result.answer_type == "rank_requirements":
+        return facts.get("rank")
+    return None
+
+
+def _resolved_topic_from_question(question: str) -> Optional[str]:
+    return _canonical_technique_from_query(question)
+
+
+def _restore_deterministic_result(state: Dict[str, Any]) -> Optional[DeterministicResult]:
+    det_path = (state.get("last_det_path") or "").strip()
+    answer_type = (state.get("last_answer_type") or "").strip()
+    facts = state.get("last_facts")
+    if not det_path or not answer_type or not isinstance(facts, dict) or not facts:
+        return None
+    return DeterministicResult(
+        answered=True,
+        det_path=det_path,
+        answer_type=answer_type,
+        facts=dict(facts),
+        source_refs=_restore_source_refs(state.get("last_source_refs")),
+        confidence=float(state.get("last_confidence") or 1.0),
+        display_hints=dict(state.get("last_display_hints") or {}),
+        followup_suggestions=list(state.get("last_followup_suggestions") or []),
+    )
+
+
+def _rewrite_vague_followup(topic: str) -> str:
+    clean_topic = (topic or "").strip().rstrip(".!?")
+    return f"Explain {clean_topic} in more detail."
+
+
+def resolve_followup_question(
+    question: str,
+    session_state: Any | None = None,
+) -> FollowupResolution:
+    original_question = (question or "").strip()
+    if not is_vague_followup_prompt(original_question):
+        return FollowupResolution(
+            original_question=original_question,
+            effective_question=original_question,
+        )
+
+    state = _get_followup_state(session_state)
+    topic = (state.get("last_resolved_topic") or "").strip()
+    if not topic:
+        return FollowupResolution(
+            original_question=original_question,
+            effective_question=original_question,
+            is_vague_followup=True,
+            clarification_text=_FOLLOWUP_CLARIFICATION,
+        )
+
+    return FollowupResolution(
+        original_question=original_question,
+        effective_question=_rewrite_vague_followup(topic),
+        is_vague_followup=True,
+        used_prior_topic=True,
+        resolved_topic=topic,
+        cached_result=_restore_deterministic_result(state),
+    )
+
+
+def _remember_last_answer(
+    session_state: Any | None,
+    *,
+    original_question: str,
+    effective_question: str,
+    answer_text: str,
+    deterministic_result: Optional[DeterministicResult] = None,
+) -> None:
+    if session_state is None:
+        return
+
+    resolved_topic = None
+    if deterministic_result is not None:
+        resolved_topic = _resolved_topic_from_result(deterministic_result)
+    if not resolved_topic:
+        resolved_topic = _resolved_topic_from_question(effective_question) or _resolved_topic_from_question(original_question)
+
+    session_state[_SESSION_FOLLOWUP_STATE_KEY] = {
+        "last_user_question": original_question,
+        "last_effective_question": effective_question,
+        "last_answer_text": answer_text.strip(),
+        "last_det_path": deterministic_result.det_path if deterministic_result else None,
+        "last_answer_type": deterministic_result.answer_type if deterministic_result else "grounded_generation",
+        "last_facts": dict(deterministic_result.facts) if deterministic_result else {},
+        "last_source_refs": _serialize_source_refs(deterministic_result.source_refs) if deterministic_result else [],
+        "last_resolved_topic": resolved_topic,
+        "last_confidence": deterministic_result.confidence if deterministic_result else None,
+        "last_display_hints": dict(deterministic_result.display_hints) if deterministic_result else {},
+        "last_followup_suggestions": list(deterministic_result.followup_suggestions) if deterministic_result else [],
+    }
+
+
+def _with_followup_debug(
+    payload: Dict[str, Any],
+    resolution: FollowupResolution,
+) -> Dict[str, Any]:
+    merged = dict(payload)
+    if resolution.is_vague_followup:
+        merged["followup"] = {
+            "original_question": resolution.original_question,
+            "effective_question": resolution.effective_question,
+            "used_prior_topic": resolution.used_prior_topic,
+            "resolved_topic": resolution.resolved_topic,
+            "needs_clarification": resolution.needs_clarification,
+        }
+    return merged
+
+
+def _empty_answer_text(resolution: FollowupResolution) -> str:
+    if resolution.is_vague_followup and resolution.resolved_topic:
+        return (
+            f"I can unpack {resolution.resolved_topic} further, "
+            "but I need a more specific angle to stay grounded."
+        )
+    if resolution.is_vague_followup:
+        return _FOLLOWUP_CLARIFICATION
+    return _EMPTY_GROUNDED_ANSWER
+
+
+def _format_score(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.3f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _render_stage_candidates(title: str, candidates: List[Dict[str, Any]]) -> None:
+    with st.expander(title, expanded=False):
+        if not candidates:
+            st.caption("No candidates for this stage.")
+            return
+
+        for i, candidate in enumerate(candidates, 1):
+            meta = candidate.get("meta") or {}
+            source_file = meta.get("source_file") or candidate.get("source") or ""
+            name = os.path.basename(source_file)
+            page_range = _format_page_range(meta)
+            heading_path = " > ".join(meta.get("heading_path") or [])
+            tags = _format_detected_tags(meta)
+            priority_bucket = meta.get("priority_bucket") or f"p{max(1, 4 - int(meta.get('priority', 1) or 1))}"
+            score_line = (
+                f"dense={_format_score(candidate.get('dense_score'))}, "
+                f"lexical={_format_score(candidate.get('lexical_score'))}, "
+                f"rrf={_format_score(candidate.get('rrf_score'))}, "
+                f"heuristic={_format_score(candidate.get('heuristic_score'))}, "
+                f"reranker={_format_score(candidate.get('reranker_score'))}, "
+                f"final={_format_score(candidate.get('final_score'))}"
+            )
+
+            st.write(f"[{i}] {name}")
+            st.caption(score_line)
+            if page_range:
+                st.caption(f"Pages: {page_range}")
+            if heading_path:
+                st.caption(f"Heading: {heading_path}")
+            st.caption(f"Priority bucket: {priority_bucket}")
+            if tags:
+                st.caption(f"Tags: {tags}")
 
 
 # --------------------------------------------------------------------
@@ -675,54 +1086,68 @@ def _parse_tech_csv_line(line: str) -> Optional[Dict[str, str]]:
     }
 
 
-def _render_single_technique(row: Dict[str, str], *, bullets: bool, tone: str, detail_mode: str) -> str:
-    """
-    Format a single technique into bullets or paragraph. 'detail_mode' in {"Brief","Standard","Full"}.
-    """
-    title  = row.get("name","Technique")
-    jp     = row.get("japanese","")
-    en     = row.get("english","")
-    family = row.get("family","")
-    rank   = row.get("rank_intro","")
-    focus  = row.get("focus","")
-    safety = row.get("safety","")
-    part   = row.get("partner_required","")
-    solo   = row.get("solo","")
-    tags   = row.get("tags","")
-    defin  = (row.get("definition") or "").strip()
+def _detail_style() -> str:
+    value = (TECH_DETAIL_MODE or "Standard").strip().lower()
+    if value not in {"brief", "standard", "full"}:
+        return "standard"
+    return value
 
-    if detail_mode == "Brief":
-        brief = [f"{title}:"]
-        if en:  brief.append(f"- English: {en}")
-        if jp:  brief.append(f"- Japanese: {jp}")
-        if defin: brief.append(f"- Definition: {defin if defin.endswith('.') else defin + '.'}")
-        body = "\n".join(brief)
 
-    elif detail_mode == "Standard":
-        std = [f"{title}:"]
-        if en:      std.append(f"- English: {en}")
-        if jp:      std.append(f"- Japanese: {jp}")
-        if family:  std.append(f"- Family: {family}")
-        if rank:    std.append(f"- Rank intro: {rank}")
-        if focus:   std.append(f"- Focus: {focus}")
-        if defin:   std.append(f"- Definition: {defin if defin.endswith('.') else defin + '.'}")
-        body = "\n".join(std)
+def _deterministic_output_format() -> str:
+    return "bullets" if output_style == "Bullets" else "paragraph"
 
-    else:  # Full
-        full = [f"{title}:"]
-        if jp:      full.append(f"- Japanese: {jp}")
-        if en:      full.append(f"- English: {en}")
-        if family:  full.append(f"- Family: {family}")
-        if rank:    full.append(f"- Rank intro: {rank}")
-        if focus:   full.append(f"- Focus: {focus}")
-        if safety:  full.append(f"- Safety: {safety}")
-        if part:    full.append(f"- Partner required: {part}")
-        if solo:    full.append(f"- Solo: {solo}")
-        if tags:    full.append(f"- Tags: {tags}")
-        if defin:   full.append(f"- Definition: {defin if defin.endswith('.') else defin + '.'}")
-        body = "\n".join(full)
 
-    return _render_det(body, bullets=bullets, tone=tone)
+def _compose_deterministic_result(
+    question: str,
+    result: DeterministicResult,
+    passages: List[Dict[str, Any]],
+    *,
+    style_override: Optional[str] = None,
+) -> Tuple[str, str, Dict[str, Any]]:
+    supporting_passages = filter_supporting_chunks(passages, result.source_refs, limit=6)
+    route_decision = select_generation_route(
+        question,
+        supporting_passages,
+        fact_count=len(result.facts),
+        deterministic_mode=True,
+    )
+    strict_label = "🔒 Strict (context-only, explain)" if result.display_hints.get("explain", True) else "🔒 Strict (context-only)"
+
+    if route_decision.use_model:
+        generated = generate_grounded_answer(
+            question,
+            supporting_passages,
+            facts=result.facts,
+            source_refs=result.source_refs,
+            deterministic_mode=True,
+        )
+        if generated.text.strip():
+            return f"{strict_label}\n\n{generated.text.strip()}", generated.raw_json, generated.debug
+
+        route_debug = dict(generated.debug)
+        route_debug["model_used"] = "deterministic_composer"
+        route_debug["local_composer_fallback"] = True
+        route_debug["fallback_used"] = True
+        route_debug["fallback_reason"] = (
+            route_debug.get("fallback_reason")
+            or "Synthesis composition returned no text; used local deterministic composer."
+        )
+    else:
+        route_debug = route_decision.to_debug_payload(
+            model_used="deterministic_composer",
+            selected_chunk_count=len(supporting_passages),
+            selected_fact_count=len(result.facts),
+            context_char_count=0,
+        )
+
+    body = compose_deterministic_answer(
+        result,
+        style=style_override or _detail_style(),
+        output_format=_deterministic_output_format(),
+        explanation_mode=True,
+        tone=tone_style,
+    )
+    return f"{strict_label}\n\n{body}", json.dumps(result.to_dict(), ensure_ascii=False), route_debug
 
 
 def answer_single_technique_if_synthetic(
@@ -731,7 +1156,7 @@ def answer_single_technique_if_synthetic(
     bullets: bool,
     tone: str,
     detail_mode: str
-) -> Optional[str]:
+) -> Optional[DeterministicResult]:
     """
     If the first passage is our synthetic single-technique CSV line, parse & render it now.
     """
@@ -745,7 +1170,28 @@ def answer_single_technique_if_synthetic(
     row = _parse_tech_csv_line(line)
     if not row:
         return None
-    return _render_single_technique(row, bullets=bullets, tone=tone, detail_mode=detail_mode)
+    tags_raw = row.get("tags") or ""
+    tags = [item.strip() for item in tags_raw.split(",") if item.strip()]
+    return build_result(
+        det_path="technique/single",
+        answer_type="technique",
+        facts={
+            "technique_name": row.get("name"),
+            "japanese": row.get("japanese"),
+            "translation": row.get("english"),
+            "type": row.get("family"),
+            "rank_context": row.get("rank_intro"),
+            "primary_focus": row.get("focus"),
+            "safety": row.get("safety"),
+            "partner_required": row.get("partner_required"),
+            "solo": row.get("solo"),
+            "tags": tags,
+            "definition": row.get("definition"),
+        },
+        preferred_sources=["Technique Descriptions.md"],
+        confidence=0.99,
+        display_hints={"explain": True},
+    )
 
 
 # --- Technique CSV line injector (for single-technique queries) ----------------
@@ -759,7 +1205,7 @@ def _fold(s: str) -> str:
     return s.lower().strip()
 
 
-def _is_single_technique_query(q: str) -> Optional[str]:
+def _extract_single_technique_candidate(q: str) -> Optional[str]:
     """
     Return a candidate technique name if the query looks like a single technique ask,
     else None. Handles 'explain/define/what is ... (no kata)?'
@@ -774,7 +1220,7 @@ def _is_single_technique_query(q: str) -> Optional[str]:
     return cand if 2 <= len(cand) <= 80 else None
 
 
-def _tech_name_variants(name: str) -> list[str]:
+def _candidate_technique_name_variants(name: str) -> list[str]:
     v = [name.strip()]
     ln = name.strip().lower()
     if ln.endswith(" no kata"):
@@ -819,11 +1265,11 @@ def _find_tech_line_in_chunks(name_variants: list[str]) -> Optional[str]:
 
 
 def inject_specific_technique_line_if_needed(question: str, passages: list[dict]) -> list[dict]:
-    cand = _is_single_technique_query(question)
+    cand = _extract_single_technique_candidate(question)
     if not cand:
         return passages
 
-    variants = _tech_name_variants(cand)
+    variants = _candidate_technique_name_variants(cand)
     line = _find_tech_line_in_chunks(variants)
     if not line:
         return passages
@@ -841,146 +1287,6 @@ def inject_specific_technique_line_if_needed(question: str, passages: list[dict]
     return passages
 
 
-# --------------------------------------------------------------------
-# LLM backend (fallback)
-# --------------------------------------------------------------------
-def call_llm(
-    prompt: str,
-    system: str = "You are a precise assistant. Use only the provided context."
-) -> Tuple[str, str]:
-    import requests
-    model = os.environ.get("MODEL", "gpt-4o-mini")
-    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
-    base = (
-        os.environ.get("OPENAI_BASE_URL")
-        or os.environ.get("OPENROUTER_API_BASE")
-        or os.environ.get("LM_STUDIO_BASE_URL")
-        or "http://localhost:1234/v1"
-    )
-
-    headers = {"Content-Type": "application/json"}
-    if "openai" in base or "openrouter" in base:
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 600,
-    }
-
-    try:
-        r = requests.post(f"{base}/chat/completions", headers=headers, json=body, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-        return text, json.dumps(data)[:4000]
-    except Exception as e:
-        return "", json.dumps({"error": type(e).__name__, "detail": str(e)})[:4000]
-
-
-# --------------------------------------------------------------------
-# Prompt & deterministic rendering helpers
-# --------------------------------------------------------------------
-def build_prompt(context: str, question: str) -> str:
-    return (
-        "You must answer using ONLY the context below.\n"
-        "Be concise but complete; avoid filler.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {question}\n\n"
-        "Answer:"
-    )
-
-
-def _apply_tone(text: str, tone: str) -> str:
-    """Light-touch tone adjustments; Chatty adds a friendly closer for non-bullets."""
-    if tone == "Chatty":
-        if "\n" not in text.strip():
-            return text.strip() + " Want a quick drill or a bit of history too?"
-        return text
-    return text
-
-
-def _bullets_to_paragraph(text: str) -> str:
-    """Convert our fielded bullet output into a compact paragraph."""
-    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
-    if not lines:
-        return text
-    head = lines[0].rstrip(":")
-    fields = {}
-    for ln in lines[1:]:
-        if ln.startswith("- "):
-            ln = ln[2:]
-        if ":" in ln:
-            k, v = ln.split(":", 1)
-            fields[k.strip().lower()] = v.strip().rstrip(".")
-    segs = [head + ":"]
-    if "translation" in fields:
-        segs.append(f'“{fields["translation"]}”.')
-    if "type" in fields:
-        segs.append(f'Type: {fields["type"]}.')
-    if "focus" in fields:
-        segs.append(f'Focus: {fields["focus"]}.')
-    if "weapons" in fields:
-        segs.append(f'Weapons: {fields["weapons"]}.')
-    if "notes" in fields:
-        segs.append(f'Notes: {fields["notes"]}.')
-    return " ".join(segs).strip()
-
-
-def _render_det(text: str, *, bullets: bool, tone: str) -> str:
-    """
-    Deterministic renderer:
-    - Bullets + Chatty: prepend a synthesized 'Quick take' line from the fields.
-    - Bullets + Crisp: return bullets as-is.
-    - Paragraph modes: convert bullets to paragraph then tone-adjust.
-    """
-    if bullets:
-        if tone == "Chatty":
-            lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
-            title = lines[0].rstrip(":") if lines else ""
-            fields = {}
-            for ln in lines[1:]:
-                if ln.startswith("- "):
-                    ln = ln[2:]
-                if ":" in ln:
-                    k, v = ln.split(":", 1)
-                    fields[k.strip().lower()] = v.strip()
-            trans = fields.get("translation")
-            typ = fields.get("type")
-            focus = fields.get("focus")
-            quick_bits = []
-            if trans: quick_bits.append(trans)
-            if typ: quick_bits.append(typ)
-            quick = " — ".join(quick_bits) if quick_bits else None
-            if quick and focus:
-                summary = f"Quick take: {quick}; focus on {focus}."
-            elif quick:
-                summary = f"Quick take: {quick}."
-            elif focus:
-                summary = f"Quick take: focus on {focus}."
-            else:
-                summary = None
-
-            out = []
-            if summary:
-                out.append(summary)
-            out.append(text.strip())
-            out = "\n".join(out)
-            if not out.strip().endswith("?"):
-                out += "\n\nWant examples, drills, or lineage notes next?"
-            return out
-        else:
-            return text.strip()
-
-    para = _bullets_to_paragraph(text)
-    return _apply_tone(para, tone)
-
-
 # --- School intent detection ---
 def is_school_query(question: str) -> bool:
     ql = question.lower()
@@ -991,147 +1297,236 @@ def is_school_query(question: str) -> bool:
     return (" ryu" in ql) or (" ryū" in ql)
 
 
-def is_soke_query(q: str) -> bool:
-    ql = q.lower()
-    return any(token in ql for token in [
-        "soke", "sōke", "current soke", "who is the soke", "who is the sōke",
-        "grandmaster", "current grandmaster", "who is the grandmaster"
-    ])
 
 
 # --------------------------------------------------------------------
 # Core RAG pipeline
 # --------------------------------------------------------------------
-def answer_with_rag(question: str, k: int | None = None) -> Tuple[str, List[Dict[str, Any]], str]:
-    if k is None:
-        k = TOP_K
+def _prepare_deterministic_passages(question: str) -> List[Dict[str, Any]]:
+    _, chunks = _load_index_and_meta()
+    passages = list(chunks)
+    passages = inject_rank_passage_if_needed(question, passages)
+    passages = inject_leadership_passage_if_needed(question, passages)
+    passages = inject_schools_passage_if_needed(question, passages)
+    passages = inject_weapons_passage_if_needed(question, passages)
+    passages = inject_kihon_passage_if_needed(question, passages)
+    passages = inject_techniques_passage_if_needed(question, passages)
+    passages = inject_specific_technique_line_if_needed(question, passages)
+    return passages
 
-    # 1) Retrieve
-    hits = retrieve(question, k=k)
 
-    # 2) Inject domain-critical sources
-    hits = inject_rank_passage_if_needed(question, hits)
-    hits = inject_leadership_passage_if_needed(question, hits)
-    hits = inject_schools_passage_if_needed(question, hits)
-    hits = inject_weapons_passage_if_needed(question, hits)
-    hits = inject_kihon_passage_if_needed(question, hits)
-    hits = inject_techniques_passage_if_needed(question, hits)
-    hits = inject_specific_technique_line_if_needed(question, hits)
-
-    # Fast-path: if we injected a single technique CSV line, answer immediately
+# --------------------------------------------------------------------
+# Deterministic bridge
+# --------------------------------------------------------------------
+def _answer_from_passages(
+    question: str,
+    passages: List[Dict[str, Any]],
+) -> Optional[Tuple[str, List[Dict[str, Any]], str, Dict[str, Any], DeterministicResult]]:
     fast = answer_single_technique_if_synthetic(
-        hits,
+        passages,
         bullets=(output_style == "Bullets"),
         tone=tone_style,
         detail_mode=TECH_DETAIL_MODE,
     )
     if fast:
-        return f"🔒 Strict (context-only, explain)\n\n{fast}", hits, '{"det_path":"technique/single"}'
+        answer_text, raw, route_debug = _compose_deterministic_result(question, fast, passages)
+        return answer_text, passages, raw, route_debug, fast
 
-    # Leadership (Sōke) gets priority over school profile if asked directly
-    if is_soke_query(question):
-        ans = try_leadership(question, hits)
-        if ans:
-            return ans, hits, '{"det_path":"leadership/soke"}'
+    if is_school_catalog_query(question):
+        try:
+            catalog_ans = try_answer_school_catalog(
+                question, passages, bullets=(output_style == "Bullets")
+            )
+        except Exception:
+            catalog_ans = None
+        if catalog_ans:
+            answer_text, raw, route_debug = _compose_deterministic_result(question, catalog_ans, passages)
+            return answer_text, passages, raw, route_debug, catalog_ans
 
-    # Schools LIST short-circuit
     if is_school_list_query(question):
         try:
             list_ans = try_answer_schools_list(
-                question, hits, bullets=(output_style == "Bullets")
+                question, passages, bullets=(output_style == "Bullets")
             )
         except Exception:
             list_ans = None
         if list_ans:
-            rendered = _render_det(list_ans, bullets=(output_style == "Bullets"), tone=tone_style)
-            return (
-                f"🔒 Strict (context-only, explain)\n\n{rendered}",
-                hits,
-                '{"det_path":"schools/list"}'
-            )
+            answer_text, raw, route_debug = _compose_deterministic_result(question, list_ans, passages)
+            return answer_text, passages, raw, route_debug, list_ans
 
-    # School PROFILE short-circuit
     if is_school_query(question):
         try:
             school_fact = try_answer_school_profile(
-                question, hits, bullets=(output_style == "Bullets")
+                question, passages, bullets=(output_style == "Bullets")
             )
         except Exception:
             school_fact = None
         if school_fact:
-            rendered = _render_det(school_fact, bullets=(output_style == "Bullets"), tone=tone_style)
-            return (
-                f"🔒 Strict (context-only, explain)\n\n{rendered}",
-                hits,
-                '{"det_path":"schools/profile"}'
-            )
+            answer_text, raw, route_debug = _compose_deterministic_result(question, school_fact, passages)
+            return answer_text, passages, raw, route_debug, school_fact
 
-        # fallback LLM for schools
-        ctx = build_context(hits)
-        prompt = build_prompt(ctx, question)
-        text, raw = call_llm(prompt)
-        if not text.strip():
-            return "🔒 Strict (context-only)\n\n❌ Model returned no text.", hits, raw or "{}"
-        return f"🔒 Strict (context-only, explain)\n\n{text.strip()}", hits, raw or "{}"
-
-    # Leadership short-circuit (generic)
-    asking_soke = any(t in question.lower() for t in [
-        "soke","sōke","grandmaster","headmaster","current head","current grandmaster"
-    ])
-    if asking_soke:
-        try:
-            fact = try_leadership(question, hits)
-        except Exception:
-            fact = None
-        if fact:
-            return f"🔒 Strict (context-only, explain)\n\n{fact}", hits, '{"det_path":"leadership/soke"}'
-
-    # Weapon rank short-circuit
     try:
-        wr = try_answer_weapon_rank(question, hits)
+        wr = try_answer_weapon_rank(question, passages)
     except Exception:
         wr = None
     if wr:
-        return f"🔒 Strict (context-only)\n\n{wr}", hits, '{"det_path":"weapons/rank"}'
+        answer_text, raw, route_debug = _compose_deterministic_result(question, wr, passages)
+        return answer_text, passages, raw, route_debug, wr
 
-    # Rank requirements short-circuit
     try:
-        rr = try_answer_rank_requirements(question, hits)
+        rank_requirements = try_answer_rank_requirements(question, passages)
     except Exception:
-        rr = None
-    if rr:
-        rendered = _render_det(rr, bullets=(output_style == "Bullets"), tone=tone_style)
-        return f"🔒 Strict (context-only, explain)\n\n{rendered}", hits, '{"det_path":"rank/requirements"}'
+        rank_requirements = None
+    if rank_requirements:
+        answer_text, raw, route_debug = _compose_deterministic_result(
+            question,
+            rank_requirements,
+            passages,
+        )
+        return answer_text, passages, raw, route_debug, rank_requirements
 
-    # Kihon Happo hard short-circuit
-    q_low = (question or "").lower()
-    if "kihon happo" in q_low or "kihon happō" in q_low:
-        kihon_ans = try_answer_kihon_happo(question, hits)
-        if kihon_ans:
-            rendered = _render_det(kihon_ans, bullets=(output_style == "Bullets"), tone=tone_style)
-            return f"🔒 Strict (context-only, explain)\n\n{rendered}", hits, '{"det_path":"deterministic/kihon"}'
+    try:
+        kamae_result = try_answer_kamae(question, passages)
+    except Exception:
+        kamae_result = None
+    if kamae_result:
+        answer_text, raw, route_debug = _compose_deterministic_result(question, kamae_result, passages)
+        return answer_text, passages, raw, route_debug, kamae_result
 
-    # Generic deterministic dispatcher
-    fact = try_extract_answer(question, hits)
+    try:
+        lineage_person = try_answer_lineage_person(question, passages)
+    except Exception:
+        lineage_person = None
+    if lineage_person:
+        answer_text, raw, route_debug = _compose_deterministic_result(question, lineage_person, passages)
+        return answer_text, passages, raw, route_debug, lineage_person
+
+    fact = try_extract_answer(question, passages)
     if fact:
-        rendered = _render_det(fact, bullets=(output_style == "Bullets"), tone=tone_style)
-        ql = question.lower()
-        looks_like_kata = (" kata" in ql) or ("no kata" in ql) or re.search(r"\bexplain\s+.+\s+no\s+kata\b", ql)
-        det_tag = '{"det_path":"technique/core"}' if looks_like_kata else '{"det_path":"deterministic/core"}'
-        return f"🔒 Strict (context-only, explain)\n\n{rendered}", hits, det_tag
+        answer_text, raw, route_debug = _compose_deterministic_result(question, fact, passages)
+        return answer_text, passages, raw, route_debug, fact
 
-    # LLM fallback with retrieved context
-    ctx = build_context(hits)
-    prompt = build_prompt(ctx, question)
-    text, raw = call_llm(prompt)
-    if not text.strip():
-        return "🔒 Strict (context-only)\n\n❌ Model returned no text.", hits, raw or "{}"
-    return f"🔒 Strict (context-only, explain)\n\n{text.strip()}", hits, raw or "{}"
+    return None
+
+
+def _answer_from_cached_followup_result(
+    question: str,
+    result: DeterministicResult,
+) -> Tuple[str, List[Dict[str, Any]], str, Dict[str, Any]]:
+    answer_text, raw, route_debug = _compose_deterministic_result(
+        question,
+        result,
+        [],
+        style_override="full",
+    )
+    debug_payload = _with_llm_routing_debug(
+        _empty_retrieval_debug("Reused prior deterministic answer for a vague follow-up."),
+        route_debug,
+    )
+    return answer_text, [], raw, debug_payload
 
 
 # --------------------------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------------------------
+def answer_with_rag(
+    question: str,
+    k: int | None = None,
+    *,
+    session_state: Any | None = None,
+) -> Tuple[str, List[Dict[str, Any]], str, Dict[str, Any]]:
+    global _LAST_RETRIEVAL_RESULT
+
+    if k is None:
+        k = TOP_K
+
+    resolution = resolve_followup_question(question, session_state)
+    effective_question = resolution.effective_question
+
+    if resolution.needs_clarification:
+        _LAST_RETRIEVAL_RESULT = None
+        debug_payload = _with_followup_debug(
+            _empty_retrieval_debug("Vague follow-up requested without a prior resolved topic."),
+            resolution,
+        )
+        return resolution.clarification_text or _FOLLOWUP_CLARIFICATION, [], "{}", debug_payload
+
+    if resolution.cached_result is not None:
+        _LAST_RETRIEVAL_RESULT = None
+        answer, hits, raw, retrieval_debug = _answer_from_cached_followup_result(
+            effective_question,
+            resolution.cached_result,
+        )
+        retrieval_debug = _with_followup_debug(retrieval_debug, resolution)
+        _remember_last_answer(
+            session_state,
+            original_question=resolution.original_question,
+            effective_question=effective_question,
+            answer_text=answer,
+            deterministic_result=resolution.cached_result,
+        )
+        return answer, hits, raw, retrieval_debug
+
+    prepass_passages = _prepare_deterministic_passages(effective_question)
+    prepass_answer = _answer_from_passages(effective_question, prepass_passages)
+    if prepass_answer:
+        _LAST_RETRIEVAL_RESULT = None
+        answer, hits, raw, route_debug, det_result = prepass_answer
+        retrieval_debug = _with_llm_routing_debug(
+            _empty_retrieval_debug("Deterministic extractor answered before retrieval."),
+            route_debug,
+        )
+        retrieval_debug = _with_followup_debug(retrieval_debug, resolution)
+        _remember_last_answer(
+            session_state,
+            original_question=resolution.original_question,
+            effective_question=effective_question,
+            answer_text=answer,
+            deterministic_result=det_result,
+        )
+        return answer, hits, raw, retrieval_debug
+
+    hits = retrieve(effective_question, k=k)
+    retrieval_debug = dict(get_last_retrieval_debug())
+
+    hits = inject_rank_passage_if_needed(effective_question, hits)
+    hits = inject_leadership_passage_if_needed(effective_question, hits)
+    hits = inject_schools_passage_if_needed(effective_question, hits)
+    hits = inject_weapons_passage_if_needed(effective_question, hits)
+    hits = inject_kihon_passage_if_needed(effective_question, hits)
+    hits = inject_techniques_passage_if_needed(effective_question, hits)
+    hits = inject_specific_technique_line_if_needed(effective_question, hits)
+
+    deterministic_answer = _answer_from_passages(effective_question, hits)
+    if deterministic_answer:
+        answer, det_hits, raw, route_debug, det_result = deterministic_answer
+        retrieval_debug = _with_llm_routing_debug(retrieval_debug, route_debug)
+        retrieval_debug = _with_followup_debug(retrieval_debug, resolution)
+        _remember_last_answer(
+            session_state,
+            original_question=resolution.original_question,
+            effective_question=effective_question,
+            answer_text=answer,
+            deterministic_result=det_result,
+        )
+        return answer, det_hits, raw, retrieval_debug
+
+    generated = generate_grounded_answer(effective_question, hits)
+    retrieval_debug = _with_llm_routing_debug(retrieval_debug, generated.debug)
+    retrieval_debug = _with_followup_debug(retrieval_debug, resolution)
+    if not generated.text.strip():
+        return _empty_answer_text(resolution), hits, generated.raw_json or "{}", retrieval_debug
+
+    answer = f"\U0001F512 Strict (context-only, explain)\n\n{generated.text.strip()}"
+    _remember_last_answer(
+        session_state,
+        original_question=resolution.original_question,
+        effective_question=effective_question,
+        answer_text=answer,
+    )
+    return answer, hits, generated.raw_json or "{}", retrieval_debug
+
+
 st.set_page_config(page_title="NTTV Chatbot (RAG)", page_icon="🥋", layout="wide")
 
 st.title("🥋 NTTV Chatbot (RAG)")
@@ -1154,15 +1549,20 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**Backend**")
-    base = (
-        os.environ.get("OPENAI_BASE_URL")
-        or os.environ.get("OPENROUTER_API_BASE")
-        or os.environ.get("LM_STUDIO_BASE_URL")
-        or "http://localhost:1234/v1"
-    )
-    model = os.environ.get("MODEL", "gpt-4o-mini")
-    st.caption(f"LLM base: `{base}`")
-    st.caption(f"Model: `{model}`")
+    routing_settings = LLMRoutingSettings.from_env()
+    st.caption(f"LLM base: `{routing_settings.api_base}`")
+    st.caption(f"Primary model: `{routing_settings.primary_model}`")
+    if routing_settings.use_synthesis_model:
+        synthesis_label = routing_settings.synthesis_model or "(not set)"
+        st.caption(f"Synthesis model: `{synthesis_label}`")
+        st.caption(
+            "Synthesis routing: "
+            f"min_chunks={routing_settings.synthesis_min_context_chunks}, "
+            f"explanation={routing_settings.synthesis_for_explanation_mode}, "
+            f"deterministic={routing_settings.synthesis_for_deterministic_composer}"
+        )
+    else:
+        st.caption("Synthesis model routing: disabled")
     
     if show_debug:
         st.markdown("---")
@@ -1194,7 +1594,10 @@ go = st.button("Ask", type="primary")
 if go and q.strip():
     try:
         with st.spinner("Thinking..."):
-            ans, top_passages, raw_json = answer_with_rag(q.strip())
+            ans, top_passages, raw_json, retrieval_debug = answer_with_rag(
+                q.strip(),
+                session_state=st.session_state,
+            )
     except Exception as e:
         st.error(f"Backend error: {e}")
         if show_debug:
@@ -1205,9 +1608,55 @@ if go and q.strip():
     st.write(ans)
 
     if show_debug:
-        st.markdown("### Retrieved sources")
+        st.markdown("### Retrieval Pipeline")
+        if retrieval_debug.get("deterministic_short_circuit"):
+            st.caption("Deterministic extractor answered before retrieval, so hybrid retrieval did not run.")
+        else:
+            st.caption(
+                f"Reranker requested: {retrieval_debug.get('reranker_backend_requested')} | "
+                f"used: {retrieval_debug.get('reranker_backend_used')}"
+            )
+            fallback_reason = retrieval_debug.get("reranker_fallback_reason")
+            if fallback_reason:
+                st.caption(f"Fallback: {fallback_reason}")
+
+            _render_stage_candidates("Dense candidates", retrieval_debug.get("dense_candidates") or [])
+            _render_stage_candidates("Lexical candidates", retrieval_debug.get("lexical_candidates") or [])
+            _render_stage_candidates("Fused candidates", retrieval_debug.get("fused_candidates") or [])
+            _render_stage_candidates("Reranked candidates", retrieval_debug.get("reranked_candidates") or [])
+
+        llm_debug = retrieval_debug.get("llm_routing") or {}
+        if llm_debug:
+            st.markdown("### Answer Routing")
+            st.caption(
+                f"Route: {llm_debug.get('route')} | "
+                f"model used: {llm_debug.get('model_used') or 'none'} | "
+                f"requested: {llm_debug.get('model_requested') or 'none'}"
+            )
+            st.caption(f"Reason: {llm_debug.get('reason') or 'n/a'}")
+            st.caption(
+                f"Chunks supplied: {llm_debug.get('selected_chunk_count', 0)} / {llm_debug.get('input_chunk_count', 0)} | "
+                f"Facts supplied: {llm_debug.get('selected_fact_count', 0)} / {llm_debug.get('input_fact_count', 0)}"
+            )
+            if llm_debug.get("fallback_used"):
+                st.caption(f"Model fallback: {llm_debug.get('fallback_reason')}")
+
+        st.markdown("### Final Answer Sources")
         for i, h in enumerate(top_passages, 1):
-            name = os.path.basename(h.get("source") or "")
+            meta = h.get("meta") or {}
+            source_file = meta.get("source_file") or h.get("source") or ""
+            name = os.path.basename(source_file)
+            page_range = _format_page_range(meta)
+            heading_path = " > ".join(meta.get("heading_path") or [])
+            tags = _format_detected_tags(meta)
+            priority_bucket = meta.get("priority_bucket") or f"p{max(1, 4 - int(meta.get('priority', 1) or 1))}"
+            if page_range:
+                st.caption(f"Pages: {page_range}")
+            if heading_path:
+                st.caption(f"Heading: {heading_path}")
+            st.caption(f"Priority bucket: {priority_bucket}")
+            if tags:
+                st.caption(f"Tags: {tags}")
             st.write(
                 f"[{i}] {name} — score {h.get('score', 0):.3f} — "
                 f"priority {int(h.get('meta',{}).get('priority',0))}"

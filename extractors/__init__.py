@@ -2,6 +2,8 @@
 
 from typing import List, Dict, Any, Optional
 
+from nttv_chatbot.deterministic import DeterministicResult
+
 # ----- Rank-specific extractors (most precise; run first)
 from .rank import (
     try_answer_rank_striking,
@@ -64,10 +66,10 @@ except ImportError:  # pragma: no cover
 
 def try_extract_answer(
     question: str, passages: List[Dict[str, Any]]
-) -> Optional[str]:
+) -> Optional[DeterministicResult]:
     """
     Deterministic, context-only answers for high-signal intents.
-    Return a short string or None to fall back to the LLM/generic path.
+    Return structured facts or None to fall back to the LLM/generic path.
     Order matters: most specific first.
     """
 

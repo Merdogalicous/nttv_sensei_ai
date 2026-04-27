@@ -1,13 +1,15 @@
-# extractors/kihon_happo.py
-import re
-from typing import List, Dict, Any, Optional
+from __future__ import annotations
 
-# Canonical definitions (fallbacks if parsing is noisy or incomplete)
+import re
+from typing import Any, Dict, List, Optional
+
+from nttv_chatbot.deterministic import DeterministicResult, build_result
+
+
 CANON_DEF = "Kihon Happo consists of Kosshi Kihon Sanpo and Torite Goho."
 CANON_KOSSHI = ["Ichimonji no Kata", "Hicho no Kata", "Jumonji no Kata"]
 CANON_TORITE = ["Omote Gyaku", "Omote Gyaku Ken Sabaki", "Ura Gyaku", "Musha Dori", "Ganseki Nage"]
 
-# Lines/phrases we do NOT want to treat as items if they appear in source text
 UNWANTED_HINTS = (
     "drill the kihon happo",
     "practice the kihon happo",
@@ -15,102 +17,93 @@ UNWANTED_HINTS = (
     "from all kamae",
     "the five forms of grappling",
     "torite goho gata",
-    "kihon happo.",    # trailing hashtaggy variants
-    "#",               # markdown header noise
+    "kihon happo.",
+    "#",
 )
 
-# Extra phrasings that should still trigger the extractor
 TRIGGER_PHRASES = (
-    "kihon happo", "kihon happō", "kihon-happo", "kihon-happō",
-    "eight basics", "8 basics", "the eight basics",
+    "kihon happo",
+    "kihon happo",
+    "kihon-happo",
+    "kihon-happo",
+    "eight basics",
+    "8 basics",
+    "the eight basics",
 )
 
 
-def _is_junk_line(s: str) -> bool:
-    ls = s.lower().strip()
-    return any(h in ls for h in UNWANTED_HINTS)
+def _is_junk_line(text: str) -> bool:
+    lowered = text.lower().strip()
+    return any(hint in lowered for hint in UNWANTED_HINTS)
 
 
-def _clean_item(s: str) -> str:
-    s = s.strip(" -•\t.,;").replace("  ", " ")
-    # Normalize common spacing/casing
-    s = s.replace("no  kata", "no Kata")
-    return s
+def _clean_item(text: str) -> str:
+    cleaned = text.strip(" -•\t.,;").replace("  ", " ")
+    return cleaned.replace("no  kata", "no Kata")
 
 
 def _split_items(tail: str) -> List[str]:
-    # Split on commas/semicolons; keep short/normal items; drop junk
-    parts = [p for p in re.split(r"[;,]", tail) if p.strip()]
-    items = []
-    for p in parts:
-        p2 = _clean_item(p)
-        if 2 <= len(p2) <= 60 and not _is_junk_line(p2):
-            items.append(p2)
+    items: list[str] = []
+    for part in re.split(r"[;,]", tail):
+        cleaned = _clean_item(part)
+        if 2 <= len(cleaned) <= 60 and not _is_junk_line(cleaned):
+            items.append(cleaned)
     return items
 
 
-def _extract_lists_from_text(text: str) -> (List[str], List[str]):
-    """
-    Parse Kosshi Kihon Sanpo and Torite Goho from arbitrary context lines.
-    Robust to noise, falls back to canonical if the capture looks wrong.
-    """
-    kosshi, torite = [], []
+def _extract_lists_from_text(text: str) -> tuple[List[str], List[str]]:
+    kosshi: list[str] = []
+    torite: list[str] = []
 
     for raw in (text or "").splitlines():
-        ln = raw.strip()
-        if not ln or _is_junk_line(ln):
+        line = raw.strip()
+        if not line or _is_junk_line(line):
             continue
-        low = ln.lower()
-
-        # Kosshi Kihon Sanpo line; allow 'sanpo'/'sanpō' and weak punctuation
-        if "kosshi" in low and ("sanpo" in low or "sanpō" in low):
-            tail = ln.split(":", 1)[1].strip() if ":" in ln else ln
+        lowered = line.lower()
+        if "kosshi" in lowered and ("sanpo" in lowered or "sanpo" in lowered):
+            tail = line.split(":", 1)[1].strip() if ":" in line else line
             kosshi.extend(_split_items(tail))
             continue
-
-        # Torite Goho line; allow 'goho'/'gohō'
-        if "torite" in low and ("goho" in low or "gohō" in low):
-            tail = ln.split(":", 1)[1].strip() if ":" in ln else ln
+        if "torite" in lowered and ("goho" in lowered or "goho" in lowered):
+            tail = line.split(":", 1)[1].strip() if ":" in line else line
             torite.extend(_split_items(tail))
             continue
 
-    # De-dupe while preserving order
-    def dedupe(seq: List[str]) -> List[str]:
-        seen, out = set(), []
-        for x in seq:
-            if x and x not in seen:
-                out.append(x)
-                seen.add(x)
-        return out
+    def dedupe(items: List[str]) -> List[str]:
+        seen: set[str] = set()
+        output: list[str] = []
+        for item in items:
+            if item and item not in seen:
+                output.append(item)
+                seen.add(item)
+        return output
 
     kosshi = dedupe(kosshi)
     torite = dedupe(torite)
 
-    # Heuristic sanity check: if empty or obviously noisy, use canonical
     def looks_bad(items: List[str], expected: List[str]) -> bool:
         if not items:
             return True
-        bad_hits = sum(1 for it in items if _is_junk_line(it.lower()))
-        overlap = sum(1 for it in items if it in expected)
-        return (bad_hits > 0) or (overlap < 1)
+        bad_hits = sum(1 for item in items if _is_junk_line(item.lower()))
+        overlap = sum(1 for item in items if item in expected)
+        return bad_hits > 0 or overlap < 1
 
     if looks_bad(kosshi, CANON_KOSSHI):
         kosshi = CANON_KOSSHI[:]
     else:
-        # Keep canonical ordering for the first 3 if present
-        ordered = [it for it in CANON_KOSSHI if it in kosshi]
-        for it in kosshi:
-            if it not in ordered:
-                ordered.append(it)
+        ordered = [item for item in CANON_KOSSHI if item in kosshi]
+        for item in kosshi:
+            if item not in ordered:
+                ordered.append(item)
         kosshi = ordered[:3]
 
     if looks_bad(torite, CANON_TORITE):
         torite = CANON_TORITE[:]
     else:
-        ordered = [it for it in CANON_TORITE if it in torite]
-        for it in torite:
-            if it not in ordered:
-                ordered.append(it)
+        ordered = [item for item in CANON_TORITE if item in torite]
+        for item in torite:
+            if item not in ordered:
+                ordered.append(item)
         torite = ordered[:5]
 
     return kosshi, torite
@@ -118,38 +111,41 @@ def _extract_lists_from_text(text: str) -> (List[str], List[str]):
 
 def _question_triggers_kihon(question: str) -> bool:
     ql = (question or "").lower()
-    return any(t in ql for t in TRIGGER_PHRASES)
+    return any(trigger in ql for trigger in TRIGGER_PHRASES)
 
 
-def try_answer_kihon_happo(question: str, passages: List[Dict[str, Any]]) -> Optional[str]:
-    """
-    Deterministic, context-only answer for Kihon Happo.
-    - Robustly parses lists from retrieved passages (including synthetic inserts).
-    - Falls back to canonical content if passages are noisy.
-    - Returns a concise multi-line string; the UI decides bullets vs. paragraph.
-    """
+def try_answer_kihon_happo(question: str, passages: List[Dict[str, Any]]) -> Optional[DeterministicResult]:
     if not _question_triggers_kihon(question):
         return None
 
-    # Parse lists from up to the first N passages (synthetic block should be near the top)
-    kosshi, torite = [], []
-    for p in passages[:12]:
-        k, t = _extract_lists_from_text(p.get("text", ""))
-        if k and not kosshi:
-            kosshi = k
-        if t and not torite:
-            torite = t
+    kosshi: list[str] = []
+    torite: list[str] = []
+    for passage in passages[:12]:
+        parsed_kosshi, parsed_torite = _extract_lists_from_text(passage.get("text", ""))
+        if parsed_kosshi and not kosshi:
+            kosshi = parsed_kosshi
+        if parsed_torite and not torite:
+            torite = parsed_torite
         if kosshi and torite:
             break
 
-    # Final guard: fallback to canonical if either is missing
     if not kosshi:
         kosshi = CANON_KOSSHI[:]
     if not torite:
         torite = CANON_TORITE[:]
 
-    # Deterministic output (works with both "Crisp" and "Chatty" renderers)
-    lines = ["Kihon Happo:", f"- {CANON_DEF}"]
-    lines.append(f"- Kosshi Kihon Sanpo: {', '.join(kosshi)}.")
-    lines.append(f"- Torite Goho: {', '.join(torite)}.")
-    return "\n".join(lines)
+    return build_result(
+        det_path="deterministic/kihon",
+        answer_type="kihon_happo",
+        facts={
+            "topic": "Kihon Happo",
+            "definition": CANON_DEF,
+            "kosshi_items": kosshi,
+            "torite_items": torite,
+        },
+        passages=passages,
+        preferred_sources=["nttv training reference.txt", "nttv rank requirements.txt"],
+        confidence=0.98,
+        display_hints={"explain": True},
+        followup_suggestions=["Ask about a specific Kihon Happo kata if you want a narrower answer."],
+    )

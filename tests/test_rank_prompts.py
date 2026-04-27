@@ -1,91 +1,81 @@
-# tests/test_rank_prompts.py
+import glob
 import os
 import re
-import glob
+
 import pytest
 
-# Import your extractor router
-# Assumes extractors/__init__.py exposes try_extract_answer(question, passages)
 from extractors import try_extract_answer
+from tests.helpers import render_result
 
-ROOT = os.path.dirname(os.path.dirname(__file__))  # repo/tests -> repo
+ROOT = os.path.dirname(os.path.dirname(__file__))
 RANK_PATH = os.path.join(ROOT, "data", "nttv rank requirements.txt")
 PROMPTS_DIR = os.path.join(os.path.dirname(__file__), "prompts")
 
+
 def _read_rank_text() -> str:
-    with open(RANK_PATH, "r", encoding="utf-8") as f:
-        return f.read()
+    with open(RANK_PATH, "r", encoding="utf-8") as handle:
+        return handle.read()
+
 
 def _load_prompt_blocks(path: str):
-    """
-    Parse a simple key:value prompt file with blocks separated by lines '---'.
-    Supported keys: QUESTION, EXPECT_ALL, EXPECT_ANY, EXPECT_NOT
-    """
-    with open(path, "r", encoding="utf-8") as f:
-        raw = f.read().strip()
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = handle.read().strip()
 
-    blocks = [b.strip() for b in re.split(r"^\s*---\s*$", raw, flags=re.M) if b.strip()]
+    blocks = [block.strip() for block in re.split(r"^\s*---\s*$", raw, flags=re.M) if block.strip()]
     cases = []
-    for b in blocks:
+    for block in blocks:
         obj = {"QUESTION": "", "EXPECT_ALL": [], "EXPECT_ANY": [], "EXPECT_NOT": []}
-        for line in b.splitlines():
-            if not line.strip():
+        for line in block.splitlines():
+            if not line.strip() or ":" not in line:
                 continue
-            if ":" not in line:
-                # ignore malformed lines; keep format forgiving
-                continue
-            k, v = line.split(":", 1)
-            key = k.strip().upper()
-            val = v.strip()
+            key, value = line.split(":", 1)
+            key = key.strip().upper()
+            value = value.strip()
             if key == "QUESTION":
-                obj["QUESTION"] = val
+                obj["QUESTION"] = value
             elif key == "EXPECT_ALL":
-                obj["EXPECT_ALL"] = [t.strip() for t in val.split(",") if t.strip()]
+                obj["EXPECT_ALL"] = [token.strip() for token in value.split(",") if token.strip()]
             elif key == "EXPECT_ANY":
-                obj["EXPECT_ANY"] = [t.strip() for t in re.split(r"\|", val) if t.strip()]
+                obj["EXPECT_ANY"] = [token.strip() for token in re.split(r"\|", value) if token.strip()]
             elif key == "EXPECT_NOT":
-                obj["EXPECT_NOT"] = [t.strip() for t in val.split(",") if t.strip()]
+                obj["EXPECT_NOT"] = [token.strip() for token in value.split(",") if token.strip()]
         if obj["QUESTION"]:
             cases.append(obj)
     return cases
 
+
 def _collect_cases():
     files = sorted(glob.glob(os.path.join(PROMPTS_DIR, "*.txt")))
-    all_cases = []
-    for fp in files:
-        for c in _load_prompt_blocks(fp):
-            all_cases.append((os.path.basename(fp), c))
-    return all_cases
+    cases = []
+    for path in files:
+        for case in _load_prompt_blocks(path):
+            cases.append((os.path.basename(path), case))
+    return cases
+
 
 @pytest.mark.parametrize("source_file,case", _collect_cases())
 def test_rank_prompt_cases(source_file, case):
-    question = case["QUESTION"]
-    rank_text = _read_rank_text()
+    passages = [
+        {
+            "text": _read_rank_text(),
+            "source": "nttv rank requirements.txt",
+            "meta": {"priority": 3},
+        }
+    ]
 
-    # The first passage is the injected rank file (priority doc)
-    passages = [{
-        "text": rank_text,
-        "source": "nttv rank requirements.txt",
-        "meta": {"priority": 3},
-    }]
+    answer = try_extract_answer(case["QUESTION"], passages)
+    assert answer and answer.answered, f"No answer for: {case['QUESTION']}"
 
-    # Call the deterministic extractor router
-    answer = try_extract_answer(question, passages)
+    rendered = render_result(answer, style="full", output_format="paragraph").lower()
 
-    assert isinstance(answer, str) and answer.strip(), f"No answer for: {question}"
+    for token in case.get("EXPECT_ALL", []):
+        assert token.lower() in rendered, f"Missing token '{token}' in answer: {rendered}"
 
-    ans_lo = answer.lower()
-
-    # All required tokens must appear
-    for tok in case.get("EXPECT_ALL", []):
-        assert tok.lower() in ans_lo, f"Missing token '{tok}' in answer: {answer}"
-
-    # At least one of EXPECT_ANY must appear
     any_list = case.get("EXPECT_ANY", [])
     if any_list:
-        assert any(tok.lower() in ans_lo for tok in any_list), \
-            f"None of EXPECT_ANY tokens {any_list} found in answer: {answer}"
+        assert any(token.lower() in rendered for token in any_list), (
+            f"None of EXPECT_ANY tokens {any_list} found in answer: {rendered}"
+        )
 
-    # Ensure forbidden tokens do not appear
-    for tok in case.get("EXPECT_NOT", []):
-        assert tok.lower() not in ans_lo, f"Forbidden token '{tok}' present in answer: {answer}"
+    for token in case.get("EXPECT_NOT", []):
+        assert token.lower() not in rendered, f"Forbidden token '{token}' present in answer: {rendered}"

@@ -1,4 +1,5 @@
 import pathlib
+
 from extractors.weapons import try_answer_weapon_rank
 
 TRAIN = pathlib.Path("data") / "nttv training reference.txt"
@@ -21,7 +22,7 @@ def _passages():
 
 
 def test_kusari_fundo_rank():
-    q = "At what rank do I learn kusari fundo?"
-    ans = try_answer_weapon_rank(q, _passages())
-    assert isinstance(ans, str) and ans.strip()
-    assert "4th kyu" in ans.lower()
+    ans = try_answer_weapon_rank("At what rank do I learn kusari fundo?", _passages())
+    assert ans and ans.answer_type == "weapon_rank"
+    assert ans.facts["weapon_name"].lower() == "kusari fundo"
+    assert "4th kyu" in ans.facts["rank_context"].lower()

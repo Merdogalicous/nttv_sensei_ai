@@ -13,17 +13,21 @@ transformers==4.44.2
 safetensors==0.6.2
 numpy==1.26.4
 pypdf==6.3.0
+rank-bm25==0.2.2
+# Optional structured PDF parser for ingest.py. Install to enable Docling-backed PDF parsing.
+# docling==2.88.0
 langchain-text-splitters==0.2.1
 tqdm==4.67.1
 python-docx==1.2.0
 
 # --- OpenRouter client ---
 openai==1.52.2
+# Optional two-model routing reuses the same OpenAI-compatible HTTP stack; no extra package is required.
 
 # --- Tests / utils ---
 pytest==9.0.1
 
-# --- YAML (already pinned for Render) ---
+# --- YAML / eval question files ---
 PyYAML==6.0.2
 
 # --- API Server ---
