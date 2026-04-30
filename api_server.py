@@ -73,7 +73,7 @@ def query(req: QueryReq, x_api_key: Optional[str] = Header(default=None)):
     t0 = time.perf_counter()
 
     # Full RAG pipeline (includes deterministic extractors)
-    answer, hits, det_json = answer_with_rag(req.query, k=req.top_k)
+answer, hits, det_json, _retrieval_debug = answer_with_rag(req.query, k=req.top_k)
 
     # Extract det_path from the JSON-ish payload
     det_path = None
